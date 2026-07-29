@@ -16,7 +16,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from noise_source_studio.presentation.widgets import PageHeader, SectionCard
+from noise_source_studio.presentation.widgets import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
+    PageHeader,
+    SectionCard,
+)
 
 
 class LogPage(QWidget):
@@ -26,8 +31,8 @@ class LogPage(QWidget):
         super().__init__(parent)
         self.log_file = log_file
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 26, 28, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(*PAGE_CONTENT_MARGINS)
+        layout.setSpacing(PAGE_CONTENT_SPACING)
         layout.addWidget(
             PageHeader(
                 "系统日志",

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QFrame, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
 
 
@@ -27,6 +29,13 @@ NAVIGATION_ITEMS = (
     NavigationItem("settings", "系统设置"),
 )
 
+ICON_DIRECTORY = Path(__file__).resolve().parent / "icons"
+
+
+def navigation_icon(key: str) -> QIcon:
+    """Return the scalable line icon for a navigation key."""
+    return QIcon(str(ICON_DIRECTORY / f"{key}.svg"))
+
 
 class NavigationSidebar(QFrame):
     """Fixed-width application navigation."""
@@ -36,19 +45,21 @@ class NavigationSidebar(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("navigationSidebar")
-        self.setFixedWidth(224)
+        self.setFixedWidth(240)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 20, 14, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 16, 14, 16)
+        layout.setSpacing(8)
 
         label = QLabel("功能导航")
         label.setObjectName("navigationLabel")
         self.list_widget = QListWidget()
         self.list_widget.setObjectName("navigationList")
-        self.list_widget.setSpacing(3)
+        self.list_widget.setIconSize(QSize(20, 20))
+        self.list_widget.setSpacing(2)
         for item in NAVIGATION_ITEMS:
-            list_item = QListWidgetItem(item.label)
-            list_item.setData(256, item.key)
+            list_item = QListWidgetItem(navigation_icon(item.key), item.label)
+            list_item.setData(Qt.ItemDataRole.UserRole, item.key)
+            list_item.setSizeHint(QSize(0, 44))
             self.list_widget.addItem(list_item)
 
         layout.addWidget(label)

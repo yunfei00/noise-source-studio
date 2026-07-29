@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from noise_source_studio.common.exceptions import ConfigurationError
 from noise_source_studio.common.paths import ApplicationPaths
-from noise_source_studio.version import __version__
+from noise_source_studio.version import APPLICATION_NAME, __version__
 
 
 class AppSettings(BaseSettings):
@@ -19,7 +19,7 @@ class AppSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="NSS_", extra="ignore")
 
-    application_name: str = "噪声源智能识别平台"
+    application_name: str = APPLICATION_NAME
     application_version: str = __version__
     window_width: int = Field(default=1440, ge=1180)
     window_height: int = Field(default=900, ge=720)

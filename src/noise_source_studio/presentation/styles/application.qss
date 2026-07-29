@@ -55,22 +55,21 @@ QToolTip {
 
 #headerStatusLabel {
     color: #7a8493;
-    font-size: 11px;
+    font-size: 10px;
 }
 
 #headerStatusValue {
-    color: #344256;
+    color: #2c394b;
     font-weight: 600;
-    font-size: 11px;
+    font-size: 12px;
 }
 
 #headerStatusValue[state="warning"] {
     color: #9a640e;
 }
 
-#userLabel {
-    color: #4e5a6a;
-    padding-left: 10px;
+#headerStatusValue[state="active"] {
+    color: #2463a8;
 }
 
 #navigationSidebar {
@@ -95,7 +94,7 @@ QToolTip {
 #navigationList::item {
     border: 0;
     border-left: 3px solid transparent;
-    padding: 11px 12px;
+    padding: 9px 12px;
     margin: 1px 0;
     color: #c8d0db;
 }
@@ -114,7 +113,7 @@ QToolTip {
 
 #pageTitle {
     color: #182334;
-    font-size: 23px;
+    font-size: 21px;
     font-weight: 600;
 }
 
@@ -217,7 +216,7 @@ QPushButton:disabled {
 
 #quickActionButton {
     text-align: left;
-    padding: 10px 16px;
+    padding: 8px 16px;
     background: #f8fafc;
     border: 1px solid #d8dee7;
     border-left: 3px solid #3f78b6;
@@ -225,7 +224,20 @@ QPushButton:disabled {
 }
 
 #quickActionButton:hover {
-    background: #f1f6fb;
+    background: #edf4fb;
+    border-color: #a9bfd8;
+    border-left-color: #2f75b9;
+}
+
+#quickActionButton:pressed {
+    background: #e2edf8;
+    border-color: #7fa4c8;
+    border-left-color: #245f9f;
+}
+
+#quickActionButton:focus {
+    border: 1px solid #3979b8;
+    border-left: 3px solid #2463a8;
 }
 
 QLineEdit,

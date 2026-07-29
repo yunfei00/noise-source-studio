@@ -21,7 +21,12 @@ from PySide6.QtWidgets import (
 
 from noise_source_studio.common.exceptions import ConfigurationError
 from noise_source_studio.infrastructure.config import AppSettings, SettingsManager
-from noise_source_studio.presentation.widgets import PageHeader, SectionCard
+from noise_source_studio.presentation.widgets import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
+    PageHeader,
+    SectionCard,
+)
 
 
 class SettingsPage(QWidget):
@@ -46,8 +51,8 @@ class SettingsPage(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(28, 26, 28, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(*PAGE_CONTENT_MARGINS)
+        layout.setSpacing(PAGE_CONTENT_SPACING)
         layout.addWidget(
             PageHeader(
                 "系统设置",

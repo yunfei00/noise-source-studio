@@ -30,6 +30,41 @@ from noise_source_studio.presentation.pages import (
     SinglePredictionPage,
     ValidationPage,
 )
+from noise_source_studio.version import APPLICATION_TITLE
+
+
+class HeaderStatusUnit(QFrame):
+    """Consistent top-bar status that supports runtime value updates."""
+
+    def __init__(
+        self,
+        label: str,
+        value: str,
+        state: str = "neutral",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("headerStatus")
+        self.setFixedHeight(44)
+        self.setMinimumWidth(120)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 5, 12, 5)
+        layout.setSpacing(0)
+
+        label_widget = QLabel(label)
+        label_widget.setObjectName("headerStatusLabel")
+        self.value_label = QLabel()
+        self.value_label.setObjectName("headerStatusValue")
+        layout.addWidget(label_widget)
+        layout.addWidget(self.value_label)
+        self.set_status(value, state)
+
+    def set_status(self, value: str, state: str = "neutral") -> None:
+        """Update the displayed value and its semantic color state."""
+        self.value_label.setText(value)
+        self.value_label.setProperty("state", state)
+        self.value_label.style().unpolish(self.value_label)
+        self.value_label.style().polish(self.value_label)
 
 
 class MainWindow(QMainWindow):
@@ -44,8 +79,9 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self.header_statuses: dict[str, HeaderStatusUnit] = {}
         self.setObjectName("mainWindow")
-        self.setWindowTitle(f"{settings.application_name} · Noise Source Studio")
+        self.setWindowTitle(APPLICATION_TITLE)
         self.setMinimumSize(1180, 720)
         self.resize(settings.window_width, settings.window_height)
 
@@ -92,6 +128,19 @@ class MainWindow(QMainWindow):
             self.page_stack.setCurrentIndex(index)
             self.current_page_label.setText(NAVIGATION_ITEMS[index].label)
 
+    def update_header_status(
+        self,
+        status_key: str,
+        value: str,
+        state: str = "neutral",
+    ) -> None:
+        """Update one top-bar status through the shared runtime interface."""
+        try:
+            status = self.header_statuses[status_key]
+        except KeyError as exc:
+            raise KeyError(f"Unknown header status: {status_key}") from exc
+        status.set_status(value, state)
+
     def _create_pages(
         self,
         settings_manager: SettingsManager,
@@ -111,14 +160,14 @@ class MainWindow(QMainWindow):
     def _build_header(self) -> QFrame:
         header = QFrame()
         header.setObjectName("topHeader")
-        header.setFixedHeight(70)
+        header.setFixedHeight(64)
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(22, 0, 26, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 0, 22, 0)
+        layout.setSpacing(12)
 
         brand_mark = QLabel("NS")
         brand_mark.setObjectName("brandMark")
-        brand_mark.setFixedSize(36, 36)
+        brand_mark.setFixedSize(34, 34)
         product = QWidget()
         product_layout = QVBoxLayout(product)
         product_layout.setContentsMargins(0, 0, 0, 0)
@@ -133,28 +182,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(brand_mark)
         layout.addWidget(product)
         layout.addStretch()
-        layout.addWidget(self._header_status("当前模型", "未配置", "warning"))
-        layout.addWidget(self._header_status("运行设备", "自动选择", "neutral"))
-        user_label = QLabel("本地工作区")
-        user_label.setObjectName("userLabel")
-        layout.addWidget(user_label)
+        status_definitions = (
+            ("model", "当前模型", "未配置", "warning"),
+            ("device", "计算设备", "待检测", "neutral"),
+            ("mode", "工作模式", "本地", "neutral"),
+        )
+        for key, label, value, state in status_definitions:
+            status = HeaderStatusUnit(label, value, state)
+            self.header_statuses[key] = status
+            layout.addWidget(status)
         return header
-
-    @staticmethod
-    def _header_status(label: str, value: str, state: str) -> QWidget:
-        container = QWidget()
-        container.setObjectName("headerStatus")
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(7)
-        label_widget = QLabel(label)
-        label_widget.setObjectName("headerStatusLabel")
-        value_widget = QLabel(value)
-        value_widget.setObjectName("headerStatusValue")
-        value_widget.setProperty("state", state)
-        layout.addWidget(label_widget)
-        layout.addWidget(value_widget)
-        return container
 
     def _build_status_bar(self) -> None:
         status_bar = QStatusBar()
@@ -164,7 +201,7 @@ class MainWindow(QMainWindow):
 
         version = QLabel(f"版本 {self.settings.application_version}")
         version.setObjectName("footerText")
-        ready = QLabel("●  就绪")
+        ready = QLabel("●  应用正常")
         ready.setObjectName("readyStatus")
         self.current_page_label = QLabel()
         self.current_page_label.setObjectName("footerText")

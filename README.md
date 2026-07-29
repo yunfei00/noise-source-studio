@@ -73,4 +73,19 @@ python -m ruff format --check .
 - 批处理、暂停和停止按钮目前只展示工作流骨架
 
 项目在接入真实推理前不会生成随机概率或虚构业务数据。
-推理平台GUI
+
+## 项目目录
+
+```text
+noise-source-studio/
+├── src/noise_source_studio/
+│   ├── application.py        # Qt 应用生命周期与异常处理
+│   ├── common/               # 公共异常和平台路径
+│   ├── domain/interfaces/    # 推理服务协议
+│   ├── infrastructure/       # 配置、日志和推理适配器
+│   └── presentation/         # 主窗口、页面、组件、图标和样式
+├── tests/                    # pytest 与 pytest-qt 自动化测试
+├── pyproject.toml            # 依赖、入口和开发工具配置
+├── CHANGELOG.md
+└── README.md
+```

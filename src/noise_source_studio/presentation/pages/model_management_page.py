@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
 )
 
 from noise_source_studio.presentation.widgets import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
     EmptyState,
     FileDropZone,
     PageHeader,
@@ -26,8 +28,8 @@ class ModelManagementPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 26, 28, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(*PAGE_CONTENT_MARGINS)
+        layout.setSpacing(PAGE_CONTENT_SPACING)
         layout.addWidget(
             PageHeader(
                 "模型管理",

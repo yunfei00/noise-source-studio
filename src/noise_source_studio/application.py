@@ -17,7 +17,7 @@ from noise_source_studio.common.paths import ApplicationPaths
 from noise_source_studio.infrastructure.config import SettingsManager
 from noise_source_studio.infrastructure.logging import configure_logging
 from noise_source_studio.presentation.main_window import MainWindow
-from noise_source_studio.version import __version__
+from noise_source_studio.version import APPLICATION_TITLE, __version__
 
 LOGGER = logging.getLogger("noise_source_studio.application")
 
@@ -33,7 +33,7 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     )
     app = QApplication(list(arguments) if arguments is not None else sys.argv)
     app.setApplicationName("Noise Source Studio")
-    app.setApplicationDisplayName("噪声源智能识别平台")
+    app.setApplicationDisplayName(APPLICATION_TITLE)
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Noise Source Studio")
     app.setStyle("Fusion")

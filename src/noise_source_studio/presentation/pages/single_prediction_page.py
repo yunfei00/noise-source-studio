@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from noise_source_studio.presentation.widgets import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
     EmptyState,
     FileDropZone,
     PageHeader,
@@ -37,8 +39,8 @@ class SinglePredictionPage(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(28, 26, 28, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(*PAGE_CONTENT_MARGINS)
+        layout.setSpacing(PAGE_CONTENT_SPACING)
         layout.addWidget(
             PageHeader(
                 "单文件预测",

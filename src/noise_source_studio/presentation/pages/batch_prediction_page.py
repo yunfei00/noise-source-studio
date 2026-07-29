@@ -12,7 +12,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from noise_source_studio.presentation.widgets import PageHeader, SectionCard, create_table
+from noise_source_studio.presentation.widgets import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
+    PageHeader,
+    SectionCard,
+    create_table,
+)
 
 
 class BatchPredictionPage(QWidget):
@@ -21,8 +27,8 @@ class BatchPredictionPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 26, 28, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(*PAGE_CONTENT_MARGINS)
+        layout.setSpacing(PAGE_CONTENT_SPACING)
         layout.addWidget(
             PageHeader(
                 "批量预测",

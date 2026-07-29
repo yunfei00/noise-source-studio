@@ -9,12 +9,16 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QSizePolicy,
     QTableWidget,
     QVBoxLayout,
     QWidget,
 )
+
+PAGE_CONTENT_MARGINS = (24, 20, 24, 24)
+PAGE_CONTENT_SPACING = 16
 
 
 class PageHeader(QWidget):
@@ -24,7 +28,7 @@ class PageHeader(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(3)
 
         title_label = QLabel(title)
         title_label.setObjectName("pageTitle")
@@ -48,8 +52,8 @@ class SectionCard(QFrame):
         self.setObjectName("sectionCard")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.content_layout = QVBoxLayout(self)
-        self.content_layout.setContentsMargins(20, 18, 20, 20)
-        self.content_layout.setSpacing(14)
+        self.content_layout.setContentsMargins(20, 16, 20, 18)
+        self.content_layout.setSpacing(12)
 
         if title:
             title_label = QLabel(title)
@@ -69,12 +73,13 @@ class EmptyState(QWidget):
         self,
         title: str,
         description: str,
+        max_text_width: int = 520,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 28, 24, 28)
-        layout.setSpacing(7)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(6)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         marker = QLabel("—")
@@ -87,10 +92,19 @@ class EmptyState(QWidget):
         description_label.setObjectName("emptyDescription")
         description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         description_label.setWordWrap(True)
+        description_label.setMinimumWidth(min(340, max_text_width))
+        description_label.setMaximumWidth(max_text_width)
+        description_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+
+        self.title_label = title_label
+        self.description_label = description_label
 
         layout.addWidget(marker)
-        layout.addWidget(title_label)
-        layout.addWidget(description_label)
+        layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(description_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
 
 class MetricCard(QFrame):
@@ -107,8 +121,8 @@ class MetricCard(QFrame):
         self.setObjectName("metricCard")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(5)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(4)
 
         label_widget = QLabel(label)
         label_widget.setObjectName("metricLabel")
@@ -133,7 +147,7 @@ def create_table(headers: Iterable[str], minimum_height: int = 220) -> QTableWid
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     table.verticalHeader().setVisible(False)
-    table.horizontalHeader().setStretchLastSection(True)
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
     return table
 
 

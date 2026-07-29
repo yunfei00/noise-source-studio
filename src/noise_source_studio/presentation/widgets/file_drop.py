@@ -23,8 +23,8 @@ class FileDropZone(QWidget):
         self.setObjectName("fileDropZone")
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 28, 24, 28)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(7)
 
         title_label = QLabel(title)
         title_label.setObjectName("dropTitle")

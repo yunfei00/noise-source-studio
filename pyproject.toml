@@ -32,7 +32,7 @@ noise-source-studio = "noise_source_studio.application:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-noise_source_studio = ["presentation/styles/*.qss"]
+noise_source_studio = ["presentation/icons/*.svg", "presentation/styles/*.qss"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

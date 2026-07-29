@@ -1,6 +1,8 @@
 """Reusable presentation widgets."""
 
 from noise_source_studio.presentation.widgets.common import (
+    PAGE_CONTENT_MARGINS,
+    PAGE_CONTENT_SPACING,
     EmptyState,
     MetricCard,
     PageHeader,
@@ -13,6 +15,8 @@ __all__ = [
     "EmptyState",
     "FileDropZone",
     "MetricCard",
+    "PAGE_CONTENT_MARGINS",
+    "PAGE_CONTENT_SPACING",
     "PageHeader",
     "SectionCard",
     "create_table",
