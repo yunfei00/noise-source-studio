@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noise-source-studio"
+version = "0.1.0"
+description = "Professional desktop workspace for multi-label noise source recognition"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Noise Source Studio Team" }]
+dependencies = [
+    "PySide6>=6.6,<7",
+    "platformdirs>=4.2,<5",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.2,<3",
+    "pyqtgraph>=0.13.7,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-qt>=4.4,<5",
+    "ruff>=0.5,<1",
+]
+
+[project.scripts]
+noise-source-studio = "noise_source_studio.application:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+noise_source_studio = ["presentation/styles/*.qss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --basetemp=.test-runtime"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
