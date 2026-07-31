@@ -165,8 +165,7 @@ class BatchWorker(QRunnable):
         self.signals.item_started.emit(item)
         self.signals.item_progress.emit(item, "校验文件")
         LOGGER.info(
-            "Batch item started | task_id=%s | item=%d | file=%s | model=%s@%s | "
-            "device=%s",
+            "Batch item started | task_id=%s | item=%d | file=%s | model=%s@%s | device=%s",
             self.task.task_id,
             item.sequence,
             item.file_path,

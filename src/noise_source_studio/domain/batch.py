@@ -204,6 +204,7 @@ class BatchExportResult:
     """Paths written by one automatic or manual batch export."""
 
     output_directory: Path
+    task_path: Path
     summary_path: Path
     predictions_path: Path
     errors_path: Path

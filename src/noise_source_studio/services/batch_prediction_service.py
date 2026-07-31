@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from noise_source_studio.domain.batch import (
     RUNNING_BATCH_STATUSES,
@@ -22,6 +23,7 @@ from noise_source_studio.domain.batch import (
     BatchScanSummary,
     BatchStatus,
 )
+from noise_source_studio.domain.confidence import confidence_bucket, is_low_confidence
 from noise_source_studio.domain.models import LoadedModel
 from noise_source_studio.services.result_adapter import (
     normalize_prediction_result,
@@ -279,13 +281,16 @@ class BatchPredictionService:
         output_directory = self._unique_directory(root / batch_name)
         output_directory.mkdir(parents=True)
         summary_path = output_directory / "summary.json"
+        task_path = output_directory / "task.json"
         predictions_path = output_directory / "predictions.csv"
         errors_path = output_directory / "errors.csv"
 
         self._write_predictions(task, predictions_path)
         self._write_errors(task, errors_path)
+        self._write_json_atomic(task_path, self._task_payload(task))
         summary = self._summary_payload(
             task,
+            task_path,
             summary_path,
             predictions_path,
             errors_path,
@@ -294,6 +299,7 @@ class BatchPredictionService:
 
         exported = BatchExportResult(
             output_directory=output_directory,
+            task_path=task_path,
             summary_path=summary_path,
             predictions_path=predictions_path,
             errors_path=errors_path,
@@ -301,6 +307,7 @@ class BatchPredictionService:
         if destination is None:
             task.output_directory = output_directory
             task.exported_files = {
+                "task": str(task_path),
                 "summary": str(summary_path),
                 "predictions": str(predictions_path),
                 "errors": str(errors_path),
@@ -312,6 +319,114 @@ class BatchPredictionService:
             task.status.value,
         )
         return exported
+
+    def export_filtered_results(
+        self,
+        task: BatchPredictionTask,
+        items: Iterable[BatchFileItem],
+        path: Path,
+    ) -> Path:
+        """Export only currently visible results using the canonical CSV contract."""
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=PREDICTION_COLUMNS)
+            writer.writeheader()
+            for item in items:
+                writer.writerow(self._prediction_row(task, item))
+        os.replace(temporary, destination)
+        LOGGER.info(
+            "Filtered batch results exported | task_id=%s | output=%s",
+            task.task_id,
+            destination,
+        )
+        return destination
+
+    def load_history(self, directory: Path) -> BatchPredictionTask:
+        """Restore a completed batch without loading a model or running inference."""
+        root = Path(directory)
+        summary_path = root / "summary.json"
+        predictions_path = root / "predictions.csv"
+        errors_path = root / "errors.csv"
+        task_path = root / "task.json"
+        for required in (summary_path, predictions_path, errors_path):
+            if not required.is_file():
+                raise ValueError(f"历史结果目录缺少 {required.name}。")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        task_payload = (
+            json.loads(task_path.read_text(encoding="utf-8")) if task_path.is_file() else None
+        )
+        task_info = (task_payload or summary).get("task", {})
+        model_info = (task_payload or summary).get("model", {})
+        task = BatchPredictionTask(
+            name=str(task_info.get("name", root.name)),
+            output_directory=root,
+            task_id=str(task_info.get("task_id", root.name)),
+            created_at=self._parse_datetime(task_info.get("created_at")) or datetime.now(UTC),
+            started_at=self._parse_datetime(task_info.get("started_at")),
+            finished_at=self._parse_datetime(task_info.get("finished_at")),
+            model_name=str(model_info.get("model_name", "")),
+            model_version=str(model_info.get("model_version", "")),
+            package_path=str(model_info.get("package_path", "")),
+            runtime_version=str(model_info.get("runtime_version", "")),
+            device=str(model_info.get("device", "")),
+            status=BatchStatus(str(task_info.get("status", BatchStatus.COMPLETED.value))),
+            source_directories=list(task_info.get("source_directories", [])),
+            recursive=bool(task_info.get("recursive", False)),
+            duplicate_policy=str(task_info.get("duplicate_policy", "normalized_absolute_path")),
+        )
+        prediction_items = self._items_from_predictions(predictions_path)
+        if task_payload and isinstance(task_payload.get("items"), list):
+            task.items = [self._item_from_payload(row) for row in task_payload["items"]]
+            if len(task.items) != len(prediction_items):
+                raise ValueError("task.json 与 predictions.csv 的结果数量不一致。")
+        else:
+            task.items = prediction_items
+        with errors_path.open(encoding="utf-8-sig", newline="") as handle:
+            errors = {int(row["sequence"]): row for row in csv.DictReader(handle)}
+        for item in task.items:
+            if item.sequence in errors:
+                item.error_type = errors[item.sequence].get("error_type", item.error_type)
+                item.error_message = errors[item.sequence].get("error_message", item.error_message)
+        task.exported_files = {
+            "task": str(task_path) if task_path.is_file() else "",
+            "summary": str(summary_path),
+            "predictions": str(predictions_path),
+            "errors": str(errors_path),
+        }
+        task.refresh_counts()
+        LOGGER.info("Batch history loaded | task_id=%s | source=%s", task.task_id, root)
+        return task
+
+    @staticmethod
+    def statistics(task: BatchPredictionTask) -> dict[str, Any]:
+        """Build all result-center distributions from authoritative items."""
+        successful = [item for item in task.items if item.status == BatchItemStatus.SUCCESS]
+        return {
+            "total": len(task.items),
+            "success": task.success_count,
+            "failed": task.failed_count,
+            "low_confidence": sum(is_low_confidence(item.result or {}) for item in successful),
+            "elapsed_seconds": task.elapsed_seconds,
+            "average_item_seconds": task.average_item_seconds,
+            "combinations": dict(
+                Counter(item.predicted_combination or "未识别" for item in successful)
+            ),
+            "sources": dict(
+                Counter(source for item in successful for source in item.predicted_sources)
+            ),
+            "confidence_buckets": dict(
+                Counter(confidence_bucket(item.result or {}) for item in successful)
+            ),
+            "errors": dict(
+                Counter(
+                    item.error_type or "未知错误"
+                    for item in task.items
+                    if item.status == BatchItemStatus.FAILED
+                )
+            ),
+        }
 
     @staticmethod
     def normalized_path(path: Path) -> str:
@@ -390,6 +505,7 @@ class BatchPredictionService:
     def _summary_payload(
         self,
         task: BatchPredictionTask,
+        task_path: Path,
         summary_path: Path,
         predictions_path: Path,
         errors_path: Path,
@@ -439,11 +555,132 @@ class BatchPredictionService:
                 "predicted_label_counts": dict(label_counts),
             },
             "output_files": {
+                "task": str(task_path),
                 "summary": str(summary_path),
                 "predictions": str(predictions_path),
                 "errors": str(errors_path),
             },
         }
+
+    def _task_payload(self, task: BatchPredictionTask) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "task": {
+                "task_id": task.task_id,
+                "name": task.name,
+                "created_at": self._datetime_text(task.created_at),
+                "started_at": self._datetime_text(task.started_at),
+                "finished_at": self._datetime_text(task.finished_at),
+                "status": task.status.value,
+                "recursive": task.recursive,
+                "duplicate_policy": task.duplicate_policy,
+                "source_directories": task.source_directories,
+            },
+            "model": {
+                "model_name": task.model_name,
+                "model_version": task.model_version,
+                "package_path": task.package_path,
+                "runtime_version": task.runtime_version,
+                "device": task.device,
+            },
+            "items": [
+                {
+                    "item_id": item.item_id,
+                    "sequence": item.sequence,
+                    "file_path": str(item.file_path),
+                    "file_name": item.file_name,
+                    "file_size": item.file_size,
+                    "modified_at": item.modified_at,
+                    "status": item.status.value,
+                    "status_message": item.status_message,
+                    "started_at": self._datetime_text(item.started_at),
+                    "finished_at": self._datetime_text(item.finished_at),
+                    "elapsed_ms": item.elapsed_ms,
+                    "labels": item.labels,
+                    "decision_mode": item.decision_mode,
+                    "display_probabilities": item.display_probabilities,
+                    "predicted_combination": item.predicted_combination,
+                    "predicted_sources": item.predicted_sources,
+                    "decoded_label_vector": item.decoded_label_vector,
+                    "error_type": item.error_type,
+                    "error_message": item.error_message,
+                    "retry_count": item.retry_count,
+                    "result": item.result,
+                }
+                for item in task.items
+            ],
+        }
+
+    def _items_from_predictions(self, path: Path) -> list[BatchFileItem]:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return [self._item_from_csv_row(row) for row in csv.DictReader(handle)]
+
+    def _item_from_csv_row(self, row: dict[str, str]) -> BatchFileItem:
+        payload = {key: self._csv_json(row.get(key, "")) for key in JSON_CSV_FIELDS}
+        payload.update(
+            {
+                "decision_mode": row.get("decision_mode", ""),
+                "predicted_combination": row.get("predicted_combination", ""),
+                "thresholds_applicable": row.get("thresholds_applicable", "").casefold() == "true",
+            }
+        )
+        return BatchFileItem(
+            sequence=int(row["sequence"]),
+            file_path=Path(row["file_path"]),
+            file_name=row.get("file_name", ""),
+            status=BatchItemStatus(row["status"]),
+            status_message=row.get("status", ""),
+            started_at=self._parse_datetime(row.get("started_at")),
+            finished_at=self._parse_datetime(row.get("finished_at")),
+            elapsed_ms=float(row["elapsed_ms"]) if row.get("elapsed_ms") else None,
+            labels=list(payload.get("labels", [])),
+            decision_mode=row.get("decision_mode", ""),
+            display_probabilities=list(payload.get("display_probabilities", [])),
+            predicted_combination=row.get("predicted_combination", ""),
+            predicted_sources=list(payload.get("predicted_sources", [])),
+            decoded_label_vector=list(payload.get("decoded_label_vector", [])),
+            error_type=row.get("error_type", ""),
+            error_message=row.get("error_message", ""),
+            retry_count=int(row.get("retry_count", "0") or 0),
+            result=payload,
+        )
+
+    def _item_from_payload(self, row: dict[str, Any]) -> BatchFileItem:
+        return BatchFileItem(
+            sequence=int(row["sequence"]),
+            file_path=Path(row["file_path"]),
+            item_id=str(row.get("item_id", "")) or uuid4().hex,
+            file_name=str(row.get("file_name", "")),
+            file_size=int(row.get("file_size", 0)),
+            modified_at=str(row.get("modified_at", "")),
+            status=BatchItemStatus(str(row.get("status", "pending"))),
+            status_message=str(row.get("status_message", "")),
+            started_at=self._parse_datetime(row.get("started_at")),
+            finished_at=self._parse_datetime(row.get("finished_at")),
+            elapsed_ms=row.get("elapsed_ms"),
+            labels=[str(value) for value in row.get("labels", [])],
+            decision_mode=str(row.get("decision_mode", "")),
+            display_probabilities=[float(value) for value in row.get("display_probabilities", [])],
+            predicted_combination=str(row.get("predicted_combination", "")),
+            predicted_sources=[str(value) for value in row.get("predicted_sources", [])],
+            decoded_label_vector=[int(value) for value in row.get("decoded_label_vector", [])],
+            error_type=str(row.get("error_type", "")),
+            error_message=str(row.get("error_message", "")),
+            retry_count=int(row.get("retry_count", 0)),
+            result=dict(row.get("result") or {}),
+        )
+
+    @staticmethod
+    def _csv_json(value: str) -> Any:
+        if not value:
+            return []
+        return json.loads(value)
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

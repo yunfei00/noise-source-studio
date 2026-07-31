@@ -13,6 +13,10 @@
 - 增加 item-level 错误隔离和 batch-level fatal error 分类。
 - 增加批量进度、统计、动态详情、搜索和状态筛选。
 - 增加 `summary.json`、UTF-8 BOM `predictions.csv` 与 `errors.csv` 自动导出。
+- 增加 `task.json` 完整任务快照和无需重新推理的历史结果恢复。
+- 增加文件任务、预测结果、统计分析三个页签。
+- 增加万级虚拟结果表格、组合/来源/可信度筛选、低置信度规则和筛选结果导出。
+- 增加动态概率详情、按需 CSV 波形、统计图筛选联动和 2～5 项结果对比。
 - 增加批量 fake runtime 测试和环境变量驱动的三文件真实一致性测试。
 
 ### Changed

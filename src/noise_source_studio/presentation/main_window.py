@@ -326,6 +326,9 @@ class MainWindow(QMainWindow):
         batch_page.stop_requested.connect(self._stop_batch)
         batch_page.retry_requested.connect(self._retry_batch)
         batch_page.export_requested.connect(self._export_batch_copy)
+        batch_page.filtered_export_requested.connect(self._export_filtered_batch)
+        batch_page.history_requested.connect(self._open_batch_history)
+        batch_page.waveform_requested.connect(self._preview_batch_result)
         batch_page.logs_requested.connect(lambda: self.navigation.select_page(6))
 
     @property
@@ -734,6 +737,7 @@ class MainWindow(QMainWindow):
             else "全部文件处理完成"
         )
         page.refresh_table()
+        page.show_results_tab()
         self._set_batch_ui_locked(False)
         self._set_application_state("正常")
         self.update_header_status("mode", "本地", "neutral")
@@ -778,6 +782,47 @@ class MainWindow(QMainWindow):
             "批量结果导出副本",
             page.show_export_result,
             lambda message: page.show_feedback(message, error=True),
+        )
+
+    def _export_filtered_batch(
+        self,
+        destination: Path,
+        items: list[Any],
+    ) -> None:
+        page = self._batch_prediction_page
+        self._run_task(
+            lambda: self.batch_prediction_service.export_filtered_results(
+                self.batch_task,
+                items,
+                destination,
+            ),
+            "导出当前筛选结果",
+            page.show_filtered_export_result,
+            lambda message: page.show_feedback(message, error=True),
+        )
+
+    def _open_batch_history(self, directory: Path) -> None:
+        page = self._batch_prediction_page
+        page.show_feedback("正在读取历史批量结果…")
+
+        def loaded(task: BatchPredictionTask) -> None:
+            self.batch_task = task
+            page.show_history(task)
+
+        self._run_task(
+            lambda: self.batch_prediction_service.load_history(directory),
+            "打开历史批量结果",
+            loaded,
+            lambda message: page.show_feedback(message, error=True),
+        )
+
+    def _preview_batch_result(self, source_path: Path) -> None:
+        page = self._batch_prediction_page
+        self._run_task(
+            lambda: self.prediction_service.preview_file(source_path),
+            "批量结果波形按需读取",
+            page.show_result_preview,
+            page.show_result_preview_error,
         )
 
     def _set_batch_ui_locked(self, locked: bool) -> None:

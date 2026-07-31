@@ -92,8 +92,7 @@ class FakeEngine:
 def _task(tmp_path: Path, count: int = 3) -> BatchPredictionTask:
     task = BatchPredictionTask("test", tmp_path / "outputs")
     task.items = [
-        BatchFileItem(index, _csv(tmp_path / f"file{index}.csv"))
-        for index in range(1, count + 1)
+        BatchFileItem(index, _csv(tmp_path / f"file{index}.csv")) for index in range(1, count + 1)
     ]
     task.refresh_counts()
     task.model_name = "noise-model"
@@ -414,9 +413,7 @@ def test_export_failure_does_not_mutate_results(
     assert task.items[0].result == result_before
 
 
-def test_page_table_matches_task_count(
-    qapp: QApplication, qtbot: QtBot, tmp_path: Path
-) -> None:
+def test_page_table_matches_task_count(qapp: QApplication, qtbot: QtBot, tmp_path: Path) -> None:
     page = BatchPredictionPage()
     qtbot.addWidget(page)
     page.set_task(_task(tmp_path, 4))
