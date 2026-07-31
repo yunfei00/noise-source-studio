@@ -124,7 +124,12 @@ class ModelService:
             self.inspect_package(record.package_path)
             inspection = self.engine.load_model(record.package_path, device=device)
         except Exception:
-            self._deactivate_all()
+            LOGGER.exception(
+                "Model activation failed; previous active record and session are retained | "
+                "identifier=%s | device=%s",
+                identifier,
+                device,
+            )
             raise
 
         updated = [
@@ -143,7 +148,6 @@ class ModelService:
             self._save_registry()
         except Exception as exc:
             self._records = original_records
-            self.engine.close()
             raise ModelActivationError("模型已加载，但活动状态无法保存。") from exc
 
         active = self.get_model(identifier)
@@ -199,14 +203,6 @@ class ModelService:
             for item in self._records
         ]
         self._save_registry()
-
-    def _deactivate_all(self) -> None:
-        self.engine.close()
-        self._records = [replace(record, is_active=False) for record in self._records]
-        try:
-            self._save_registry()
-        except OSError:
-            LOGGER.exception("Failed to persist safe deactivated model state")
 
     def _validate_manifest(self, manifest: dict[str, Any], package: Path) -> None:
         required = (

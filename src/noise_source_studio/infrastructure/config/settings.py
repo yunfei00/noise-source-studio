@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from noise_source_studio.common.exceptions import ConfigurationError
@@ -28,7 +28,19 @@ class AppSettings(BaseSettings):
     log_directory: Path
     log_level: str = "INFO"
     theme: str = "light"
-    default_device: str = "auto"
+    device_preference: str = "auto"
+    allow_cpu_fallback: bool = True
+
+    @field_validator("device_preference")
+    @classmethod
+    def validate_device_preference(cls, value: str) -> str:
+        """Accept automatic, CPU, or a concrete non-negative CUDA index."""
+        normalized = value.strip().lower()
+        if normalized in {"auto", "cpu"}:
+            return normalized
+        if normalized.startswith("cuda:") and normalized[5:].isdigit():
+            return f"cuda:{int(normalized[5:])}"
+        raise ValueError("device_preference 必须是 auto、cpu 或 cuda:N")
 
 
 class SettingsManager:
@@ -57,6 +69,11 @@ class SettingsManager:
             raw_data: dict[str, Any] = json.loads(
                 self.paths.config_file.read_text(encoding="utf-8")
             )
+            if (
+                "device_preference" not in raw_data
+                and "default_device" in raw_data
+            ):
+                raw_data["device_preference"] = raw_data.pop("default_device")
             merged = defaults.model_dump()
             merged.update(raw_data)
             settings = AppSettings.model_validate(merged)

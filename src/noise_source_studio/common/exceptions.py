@@ -33,6 +33,10 @@ class ModelActivationError(NoiseSourceStudioError):
     """Raised when a verified model cannot be activated safely."""
 
 
+class DeviceSelectionError(NoiseSourceStudioError):
+    """Raised when a requested compute device cannot be used safely."""
+
+
 class ActiveModelDeletionError(NoiseSourceStudioError):
     """Raised when deletion is requested for the active model."""
 

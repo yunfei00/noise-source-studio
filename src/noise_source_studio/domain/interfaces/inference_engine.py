@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from noise_source_studio.domain.device import DeviceProbeReport
 from noise_source_studio.domain.models import SignalPreview
 
 
@@ -23,6 +24,10 @@ class InferenceEngine(Protocol):
 
     def load_model(self, package_path: Path, *, device: str = "auto") -> dict[str, Any]:
         """Load and retain a compatible model session."""
+        ...
+
+    def probe_devices(self) -> DeviceProbeReport:
+        """Probe CPU and CUDA devices without loading a model."""
         ...
 
     def inspect_model(self) -> dict[str, Any]:

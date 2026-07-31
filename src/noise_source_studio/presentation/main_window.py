@@ -7,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QThreadPool, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -23,15 +23,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from noise_source_studio.common.exceptions import (
+    ConfigurationError,
+    DeviceSelectionError,
+    ModelActivationError,
+)
 from noise_source_studio.domain.batch import (
     RUNNING_BATCH_STATUSES,
     BatchPredictionTask,
     BatchStatus,
 )
+from noise_source_studio.domain.device import DeviceProbeReport, DeviceResolution
 from noise_source_studio.domain.interfaces import InferenceEngine
 from noise_source_studio.domain.models import LoadedModel, ModelRecord, PredictionOutcome
+from noise_source_studio.domain.validation import (
+    RUNNING_VALIDATION_STATUSES,
+    ValidationTask,
+)
 from noise_source_studio.infrastructure.config import AppSettings, SettingsManager
-from noise_source_studio.infrastructure.inference import BatchWorker, RuntimeAdapter
+from noise_source_studio.infrastructure.inference import (
+    BatchWorker,
+    RuntimeAdapter,
+    ValidationWorker,
+)
 from noise_source_studio.presentation.navigation import NAVIGATION_ITEMS, NavigationSidebar
 from noise_source_studio.presentation.pages import (
     BatchPredictionPage,
@@ -45,8 +59,10 @@ from noise_source_studio.presentation.pages import (
 )
 from noise_source_studio.services import (
     BatchPredictionService,
+    DeviceService,
     ModelService,
     PredictionService,
+    ValidationService,
 )
 from noise_source_studio.services.tasks import BackgroundTask, TaskFailure
 from noise_source_studio.version import APPLICATION_TITLE
@@ -56,6 +72,8 @@ LOGGER = logging.getLogger("noise_source_studio.main_window")
 
 class HeaderStatusUnit(QFrame):
     """Consistent top-bar status that supports runtime value updates."""
+
+    clicked = Signal()
 
     def __init__(
         self,
@@ -68,6 +86,7 @@ class HeaderStatusUnit(QFrame):
         self.setObjectName("headerStatus")
         self.setFixedHeight(44)
         self.setMinimumWidth(120)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 5, 12, 5)
         layout.setSpacing(0)
@@ -87,6 +106,15 @@ class HeaderStatusUnit(QFrame):
         self.value_label.style().unpolish(self.value_label)
         self.value_label.style().polish(self.value_label)
 
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        """Expose status units as keyboard-free navigation affordances."""
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
 
 class MainWindow(QMainWindow):
     """Commercial-style shell hosting all application workflows."""
@@ -100,12 +128,15 @@ class MainWindow(QMainWindow):
         model_service: ModelService | None = None,
         prediction_service: PredictionService | None = None,
         batch_prediction_service: BatchPredictionService | None = None,
+        validation_service: ValidationService | None = None,
+        device_service: DeviceService | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.header_statuses: dict[str, HeaderStatusUnit] = {}
         self.engine = engine or RuntimeAdapter()
+        self.device_service = device_service or DeviceService(self.engine)
         self.model_service = model_service or ModelService(
             settings.model_directory,
             self.engine,
@@ -117,9 +148,19 @@ class MainWindow(QMainWindow):
         self.batch_prediction_service = batch_prediction_service or BatchPredictionService(
             settings.output_directory,
         )
+        self.validation_service = validation_service or ValidationService(
+            settings.output_directory,
+        )
         self.batch_task = self.batch_prediction_service.create_task()
         self.batch_worker: BatchWorker | None = None
+        self.validation_task: ValidationTask | None = None
+        self.validation_worker: ValidationWorker | None = None
         self.loaded_model: LoadedModel | None = None
+        self.device_report: DeviceProbeReport | None = None
+        self.device_resolution: DeviceResolution | None = None
+        self._model_loading = False
+        self._model_load_generation = 0
+        self._single_prediction_running = False
         self.task_pool = QThreadPool(self)
         self.task_pool.setMaxThreadCount(1)
         self._tasks: set[BackgroundTask] = set()
@@ -167,6 +208,11 @@ class MainWindow(QMainWindow):
             app.aboutToQuit.connect(self.shutdown)
         if self.model_service.active_model() is not None:
             QTimer.singleShot(0, self._restore_active_model)
+        elif self.settings.device_preference != "cpu":
+            QTimer.singleShot(0, self._probe_devices)
+        else:
+            self.device_report = self.device_service.cpu_report()
+            self._update_settings_device_state()
 
     @property
     def page_count(self) -> int:
@@ -202,11 +248,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Release runtime resources before the window is destroyed."""
-        if self.batch_task.status in RUNNING_BATCH_STATUSES:
+        validation_running = bool(
+            self.validation_task and self.validation_task.status in RUNNING_VALIDATION_STATUSES
+        )
+        if self.batch_task.status in RUNNING_BATCH_STATUSES or validation_running:
             answer = QMessageBox.question(
                 self,
-                "批量任务仍在运行",
-                "退出将等待当前文件完成并安全停止批量任务。确定退出吗？",
+                "后台任务仍在运行",
+                "退出将等待当前文件完成并安全停止任务。确定退出吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -215,6 +264,8 @@ class MainWindow(QMainWindow):
                 return
             if self.batch_worker is not None:
                 self.batch_worker.request_stop()
+            if self.validation_worker is not None:
+                self.validation_worker.request_stop()
         self.shutdown()
         super().closeEvent(event)
 
@@ -261,7 +312,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         status_definitions = (
             ("model", "当前模型", "未配置", "warning", 220),
-            ("device", "计算设备", "待检测", "neutral", 120),
+            ("device", "计算设备", "待检测", "neutral", 220),
             ("mode", "工作模式", "本地", "neutral", 120),
         )
         for key, label, value, state, minimum_width in status_definitions:
@@ -269,6 +320,7 @@ class MainWindow(QMainWindow):
             status.setMinimumWidth(minimum_width)
             self.header_statuses[key] = status
             layout.addWidget(status)
+        self.header_statuses["device"].setToolTip("点击打开系统设置中的计算设备配置。")
         return header
 
     def _build_status_bar(self) -> None:
@@ -331,6 +383,25 @@ class MainWindow(QMainWindow):
         batch_page.waveform_requested.connect(self._preview_batch_result)
         batch_page.logs_requested.connect(lambda: self.navigation.select_page(6))
 
+        validation_page = self._validation_page
+        validation_page.manifest_check_requested.connect(self._check_validation_manifest)
+        validation_page.start_requested.connect(self._start_validation)
+        validation_page.pause_requested.connect(self._pause_validation)
+        validation_page.resume_requested.connect(self._resume_validation)
+        validation_page.stop_requested.connect(self._stop_validation)
+        validation_page.history_requested.connect(self._open_validation_history)
+        validation_page.batch_reuse_requested.connect(self._validate_existing_batch)
+        validation_page.waveform_requested.connect(self._preview_validation_sample)
+        validation_page.export_requested.connect(self._export_validation_copy)
+
+        settings_page = self._settings_page
+        settings_page.settings_save_requested.connect(self._save_settings)
+        settings_page.device_probe_requested.connect(self._probe_devices)
+        settings_page.device_details_requested.connect(self._show_device_details)
+        self.header_statuses["device"].clicked.connect(
+            lambda: self.navigation.select_page(7)
+        )
+
     @property
     def _dashboard_page(self) -> DashboardPage:
         page = self.pages[0]
@@ -350,9 +421,21 @@ class MainWindow(QMainWindow):
         return page
 
     @property
+    def _validation_page(self) -> ValidationPage:
+        page = self.pages[3]
+        assert isinstance(page, ValidationPage)
+        return page
+
+    @property
     def _model_page(self) -> ModelManagementPage:
         page = self.pages[4]
         assert isinstance(page, ModelManagementPage)
+        return page
+
+    @property
+    def _settings_page(self) -> SettingsPage:
+        page = self.pages[7]
+        assert isinstance(page, SettingsPage)
         return page
 
     def _run_task(
@@ -429,58 +512,319 @@ class MainWindow(QMainWindow):
         )
 
     def _activate_model(self, identifier: str) -> None:
-        page = self._model_page
-        page.set_busy(True, "正在后台加载模型…")
-        self._set_application_state("模型加载中")
-        self.update_header_status("model", "加载中", "warning")
-
-        def activated(loaded: LoadedModel) -> None:
-            self._apply_loaded_model(loaded)
-            self._refresh_model_views()
-            page.show_feedback(f"模型已激活：{loaded.record.display_name}", error=False)
-
-        def failed(message: str) -> None:
-            self._clear_loaded_model(load_failed=True)
-            self._refresh_model_views()
-            page.show_feedback(message, error=True)
-            QMessageBox.warning(self, "模型加载失败", message)
-
-        self._run_task(
-            lambda: self.model_service.activate_model(
-                identifier,
-                device=self.settings.default_device,
-            ),
-            "模型激活",
-            activated,
-            failed,
-            lambda: page.set_busy(False),
-        )
+        if reason := self._device_switch_block_reason():
+            self._model_page.show_feedback(reason, error=True)
+            return
+        self._begin_model_load(identifier, startup=False)
 
     def _restore_active_model(self) -> None:
         record = self.model_service.active_model()
         if record is None:
             return
+        self._begin_model_load(record.identifier, startup=True)
+
+    def _begin_model_load(
+        self,
+        identifier: str,
+        *,
+        startup: bool,
+        device_preference: str | None = None,
+    ) -> None:
+        """Resolve policy and load a candidate model session in the background."""
+        preference = device_preference or self.settings.device_preference
+        allow_fallback = self.settings.allow_cpu_fallback
+        page = self._model_page
+        self._model_load_generation += 1
+        generation = self._model_load_generation
+        self._model_loading = True
+        page.set_busy(True, "正在后台检测设备并加载模型…")
+        self._settings_page.set_device_switch_locked(
+            True,
+            "模型正在加载，暂时不能切换计算设备。",
+        )
         self._set_application_state("模型加载中")
         self.update_header_status("model", "加载中", "warning")
 
-        def failed(message: str) -> None:
-            self._clear_loaded_model(load_failed=True)
+        def activated(result: tuple[LoadedModel, DeviceResolution]) -> None:
+            loaded, resolution = result
+            self.device_resolution = resolution
+            self.device_report = resolution.report
+            self._apply_loaded_model(loaded)
             self._refresh_model_views()
-            QMessageBox.warning(
-                self,
-                "活动模型恢复失败",
-                f"{message}\n\n应用已恢复到安全的未配置状态。",
-            )
+            page.show_feedback(f"模型已激活：{loaded.record.display_name}", error=False)
+            if resolution.fallback_reason:
+                message = "CUDA 不可用，当前已使用 CPU。"
+                self.statusBar().showMessage(message, 10000)
+                self.header_statuses["device"].setToolTip(
+                    f"{message}\n{resolution.fallback_reason}"
+                )
+                self._settings_page.feedback_label.setText(
+                    f"{message} {resolution.fallback_reason}"
+                )
+
+        def failed(message: str) -> None:
+            report = self.device_service.last_report
+            if report is not None:
+                self.device_report = report
+            self._refresh_model_views()
+            page.show_feedback(message, error=True)
+            self._show_preserved_or_failed_session(preference, message)
+            if preference.startswith("cuda:") and allow_fallback:
+                self._offer_explicit_cpu_fallback(identifier, preference, message)
+            elif not startup and preference != "auto":
+                QMessageBox.warning(self, "模型加载失败", message)
+
+        def finished() -> None:
+            if generation != self._model_load_generation:
+                return
+            self._model_loading = False
+            page.set_busy(False)
+            self._settings_page.set_device_switch_locked(False)
+            self._update_settings_device_state()
 
         self._run_task(
-            lambda: self.model_service.activate_model(
-                record.identifier,
-                device=self.settings.default_device,
+            lambda: self._load_model_with_policy(
+                identifier,
+                preference,
+                allow_cpu_fallback=allow_fallback,
             ),
-            "启动恢复活动模型",
-            self._apply_loaded_model,
+            "启动恢复活动模型" if startup else "模型激活",
+            activated,
             failed,
+            finished,
         )
+
+    def _load_model_with_policy(
+        self,
+        identifier: str,
+        preference: str,
+        *,
+        allow_cpu_fallback: bool,
+    ) -> tuple[LoadedModel, DeviceResolution]:
+        """Resolve a concrete device and apply automatic CPU fallback."""
+        resolution = self.device_service.resolve(preference)
+        try:
+            loaded = self.model_service.activate_model(
+                identifier,
+                device=resolution.resolved_device,
+            )
+        except (DeviceSelectionError, ModelActivationError) as exc:
+            if (
+                preference == "auto"
+                and resolution.resolved_device.startswith("cuda:")
+                and allow_cpu_fallback
+            ):
+                reason = f"CUDA 模型加载失败：{exc}"
+                LOGGER.exception(
+                    "Automatic CUDA model load failed; retrying on CPU | device=%s",
+                    resolution.resolved_device,
+                )
+                cpu_resolution = DeviceResolution(
+                    device_preference="auto",
+                    resolved_device="cpu",
+                    report=resolution.report,
+                    fallback_reason=reason,
+                )
+                loaded = self.model_service.activate_model(identifier, device="cpu")
+                LOGGER.info("Automatic CPU fallback model load succeeded")
+                return loaded, cpu_resolution
+            raise
+        actual_resolution = DeviceResolution(
+            device_preference=resolution.device_preference,
+            resolved_device=loaded.device,
+            report=resolution.report,
+            fallback_reason=resolution.fallback_reason,
+        )
+        LOGGER.info(
+            "Model loaded on resolved device | preference=%s | resolved=%s",
+            preference,
+            loaded.device,
+        )
+        return loaded, actual_resolution
+
+    def _show_preserved_or_failed_session(
+        self,
+        preference: str,
+        message: str,
+    ) -> None:
+        """Keep an old usable session visible, or expose a truthful failed state."""
+        if self.loaded_model is not None:
+            self._apply_loaded_model(self.loaded_model)
+            self.header_statuses["device"].setToolTip(
+                f"新设备加载失败，仍在使用原会话。\n{message}"
+            )
+            self._set_application_state("正常")
+            return
+        self._clear_loaded_model(load_failed=True)
+        if preference.startswith("cuda:"):
+            self.update_header_status(
+                "device",
+                f"{preference.upper()} 不可用",
+                "warning",
+            )
+        self.header_statuses["device"].setToolTip(message)
+
+    def _offer_explicit_cpu_fallback(
+        self,
+        identifier: str,
+        preference: str,
+        message: str,
+    ) -> None:
+        choice = self._ask_cpu_fallback(preference, message)
+        if choice == "logs":
+            self.navigation.select_page(6)
+            return
+        if choice != "cpu":
+            LOGGER.info(
+                "User cancelled explicit CUDA CPU fallback | device=%s",
+                preference,
+            )
+            return
+        updated = self.settings.model_copy(update={"device_preference": "cpu"})
+        try:
+            self._settings_page.commit_settings(
+                updated,
+                "已切换设备策略为 CPU，正在重新加载模型…",
+            )
+        except ConfigurationError:
+            return
+        self.settings = updated
+        LOGGER.info(
+            "User confirmed CPU fallback | failed_device=%s | model=%s",
+            preference,
+            identifier,
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self._begin_model_load(
+                identifier,
+                startup=False,
+                device_preference="cpu",
+            ),
+        )
+
+    def _ask_cpu_fallback(self, preference: str, message: str) -> str:
+        """Return ``cpu``, ``cancel``, or ``logs`` from an explicit CUDA prompt."""
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("CUDA 设备加载失败")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(
+            f"{preference.upper()} 加载失败，是否切换到 CPU 重新加载当前模型？"
+        )
+        dialog.setInformativeText(message)
+        cpu_button = dialog.addButton(
+            "切换到 CPU",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_button = dialog.addButton(
+            "取消",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        logs_button = dialog.addButton(
+            "查看日志",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        dialog.setDefaultButton(cpu_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is cpu_button:
+            return "cpu"
+        if clicked is logs_button:
+            return "logs"
+        assert clicked is cancel_button or clicked is None
+        return "cancel"
+
+    def _save_settings(self, updated: AppSettings) -> None:
+        """Persist settings only after device-switch task guards pass."""
+        preference_changed = (
+            updated.device_preference != self.settings.device_preference
+        )
+        if preference_changed and (reason := self._device_switch_block_reason()):
+            self._settings_page.apply_settings(self.settings)
+            self._settings_page.show_error(reason)
+            return
+        try:
+            self._settings_page.commit_settings(updated)
+        except ConfigurationError:
+            return
+        previous_preference = self.settings.device_preference
+        self.settings = updated
+        LOGGER.info(
+            "User device preference saved | previous=%s | current=%s | "
+            "allow_cpu_fallback=%s",
+            previous_preference,
+            updated.device_preference,
+            updated.allow_cpu_fallback,
+        )
+        if not preference_changed:
+            self._update_settings_device_state()
+            return
+        active = self.model_service.active_model()
+        if active is not None and self.loaded_model is not None:
+            self._begin_model_load(
+                active.identifier,
+                startup=False,
+                device_preference=updated.device_preference,
+            )
+        elif updated.device_preference == "cpu":
+            self.device_report = self.device_service.cpu_report()
+            self._update_settings_device_state()
+        else:
+            self._probe_devices()
+
+    def _probe_devices(self) -> None:
+        """Detect CUDA devices in the background without changing the session."""
+        if reason := self._device_switch_block_reason():
+            self._settings_page.show_error(reason)
+            return
+        page = self._settings_page
+        page.set_probe_busy(True)
+
+        def completed(report: DeviceProbeReport) -> None:
+            self.device_report = report
+            self._update_settings_device_state()
+            LOGGER.info("Device details refreshed in settings")
+
+        self._run_task(
+            self.device_service.probe_devices,
+            "计算设备探测",
+            completed,
+            page.show_error,
+            lambda: page.set_probe_busy(False),
+        )
+
+    def _show_device_details(self) -> None:
+        report = self.device_report or self.device_service.cpu_report()
+        self._settings_page.show_device_details(report)
+
+    def _update_settings_device_state(self) -> None:
+        report = self.device_report
+        if report is None:
+            return
+        resolved_display = (
+            self.device_service.display_name(self.loaded_model.device, report)
+            if self.loaded_model is not None
+            else ""
+        )
+        self._settings_page.set_device_report(
+            report,
+            resolved_device=resolved_display,
+            cuda_status=self.device_service.cuda_status(report),
+        )
+
+    def _device_switch_block_reason(self) -> str:
+        if self._model_loading:
+            return "模型正在加载，请等待加载完成后再切换计算设备。"
+        if self._single_prediction_running:
+            return "当前推理任务正在使用计算设备，请完成或停止任务后再切换。"
+        if self.batch_task.status in RUNNING_BATCH_STATUSES:
+            return "当前批量任务正在使用计算设备，请完成或停止任务后再切换。"
+        if (
+            self.validation_task is not None
+            and self.validation_task.status in RUNNING_VALIDATION_STATUSES
+        ):
+            return "当前模型验证正在使用计算设备，请完成或停止任务后再切换。"
+        return ""
 
     def _delete_model(self, identifier: str) -> None:
         page = self._model_page
@@ -530,6 +874,11 @@ class MainWindow(QMainWindow):
             return
         locked_record = record
         page = self._single_prediction_page
+        self._single_prediction_running = True
+        self._settings_page.set_device_switch_locked(
+            True,
+            "当前推理任务正在使用计算设备，请完成后再切换。",
+        )
         page.begin_prediction()
         self._set_application_state("推理中")
 
@@ -541,6 +890,10 @@ class MainWindow(QMainWindow):
             page.show_prediction_error(message)
             self._set_application_state("推理失败")
 
+        def finished() -> None:
+            self._single_prediction_running = False
+            self._settings_page.set_device_switch_locked(False)
+
         self._run_task(
             lambda: self.prediction_service.predict_file(
                 source_path,
@@ -549,6 +902,7 @@ class MainWindow(QMainWindow):
             "单文件推理",
             completed,
             failed,
+            finished,
         )
 
     def _export_prediction(self, include_contract: bool) -> None:
@@ -568,8 +922,12 @@ class MainWindow(QMainWindow):
 
     def _apply_loaded_model(self, loaded: LoadedModel) -> None:
         self.loaded_model = loaded
+        device_display = self.device_service.display_name(
+            loaded.device,
+            self.device_report,
+        )
         self.update_header_status("model", loaded.record.display_name, "active")
-        self.update_header_status("device", loaded.device, "active")
+        self.update_header_status("device", device_display, "active")
         self.update_header_status("mode", "本地", "neutral")
         dashboard = self._dashboard_page
         dashboard.status_cards["model"].set_status(
@@ -577,12 +935,14 @@ class MainWindow(QMainWindow):
             f"prediction mode：{loaded.prediction_mode}",
         )
         dashboard.status_cards["device"].set_status(
-            loaded.device,
+            device_display,
             f"runtime {loaded.runtime_version}",
         )
         self._single_prediction_page.set_model(loaded)
         self._batch_prediction_page.set_model_available(True)
-        self._model_page.set_active_model(loaded.record, loaded.device)
+        self._validation_page.set_model(loaded)
+        self._model_page.set_active_model(loaded.record, device_display)
+        self._update_settings_device_state()
         self._set_application_state("正常")
 
     def _clear_loaded_model(self, *, load_failed: bool = False) -> None:
@@ -602,6 +962,7 @@ class MainWindow(QMainWindow):
         dashboard.status_cards["device"].set_status("待检测", "尚无可用模型会话")
         self._single_prediction_page.set_model(None)
         self._batch_prediction_page.set_model_available(False)
+        self._validation_page.set_model(None)
         self._set_application_state("正常")
 
     def _set_application_state(self, state: str) -> None:
@@ -611,6 +972,8 @@ class MainWindow(QMainWindow):
             "推理中": "正在后台执行单文件推理",
             "批量推理中": "正在复用当前模型会话顺序执行批量任务",
             "批量已暂停": "当前文件已完成，等待用户继续或停止",
+            "模型验证中": "正在复用当前模型会话执行清单验证与指标计算",
+            "验证已暂停": "当前样本已完成，等待用户继续或停止",
             "推理失败": "最近一次推理失败，请查看系统日志",
         }
         self._dashboard_page.status_cards["application"].set_status(
@@ -658,6 +1021,12 @@ class MainWindow(QMainWindow):
         page.refresh_table()
 
     def _start_batch(self) -> None:
+        if self.validation_task and self.validation_task.status in RUNNING_VALIDATION_STATUSES:
+            self._batch_prediction_page.show_feedback(
+                "模型验证运行期间不能同时启动批量预测。",
+                error=True,
+            )
+            return
         if self.loaded_model is None:
             self._batch_prediction_page.show_feedback(
                 "请先在模型管理中激活模型。",
@@ -827,6 +1196,200 @@ class MainWindow(QMainWindow):
 
     def _set_batch_ui_locked(self, locked: bool) -> None:
         self._single_prediction_page.setEnabled(not locked)
+        self._validation_page.setEnabled(not locked)
         self._model_page.set_busy(locked, "批量推理期间模型已锁定。" if locked else "")
-        self.pages[7].setEnabled(not locked)
+        self._settings_page.set_device_switch_locked(
+            locked,
+            "当前批量任务正在使用计算设备，请完成或停止任务后再切换。"
+            if locked
+            else "",
+        )
         self._batch_prediction_page.refresh_table()
+
+    def _check_validation_manifest(
+        self,
+        manifest_path: Path,
+        data_root: Path | None,
+        missing_policy: str,
+    ) -> None:
+        page = self._validation_page
+        if self.loaded_model is None:
+            page.show_error("请先在模型管理中激活模型。")
+            return
+        locked_model = self.loaded_model
+        page.progress_label.setText("正在后台检查验证清单…")
+        self._run_task(
+            lambda: self.validation_service.inspect_manifest(
+                manifest_path,
+                locked_model,
+                data_root=data_root,
+                missing_policy=missing_policy,
+            ),
+            "验证清单检查",
+            page.show_manifest_report,
+            page.show_error,
+        )
+
+    def _start_validation(self) -> None:
+        page = self._validation_page
+        if self.loaded_model is None or page.report is None:
+            page.show_error("请先激活模型并完成验证清单检查。")
+            return
+        if self.batch_task.status in RUNNING_BATCH_STATUSES:
+            page.show_error("批量预测运行期间不能同时启动模型验证。")
+            return
+        task = self.validation_service.create_task(page.report, self.loaded_model)
+        self.validation_task = task
+        page.set_task(task)
+        worker = ValidationWorker(self.engine, task)
+        self.validation_worker = worker
+        worker.signals.validation_started.connect(page.refresh_summary)
+        worker.signals.sample_started.connect(page.refresh_sample)
+        worker.signals.sample_succeeded.connect(page.refresh_sample)
+        worker.signals.sample_failed.connect(page.refresh_sample)
+        worker.signals.validation_progress.connect(lambda _task: page.refresh_summary())
+        worker.signals.validation_paused.connect(self._validation_paused)
+        worker.signals.validation_resumed.connect(self._validation_resumed)
+        worker.signals.validation_stopped.connect(self._validation_terminal)
+        worker.signals.validation_completed.connect(self._validation_terminal)
+        worker.signals.fatal_error.connect(self._validation_fatal)
+        worker.signals.finished.connect(self._validation_worker_finished)
+        self._set_validation_ui_locked(True)
+        self._set_application_state("模型验证中")
+        self.update_header_status("mode", "模型验证中", "active")
+        self.task_pool.start(worker)
+
+    def _pause_validation(self) -> None:
+        if self.validation_worker is not None:
+            self.validation_worker.request_pause()
+            self._validation_page.progress_label.setText("将在当前样本结束后暂停…")
+
+    def _resume_validation(self) -> None:
+        if self.validation_worker is not None:
+            self.validation_worker.request_resume()
+
+    def _stop_validation(self) -> None:
+        if self.validation_worker is not None:
+            self.validation_worker.request_stop()
+            self._validation_page.progress_label.setText("正在安全停止验证任务…")
+
+    def _validation_paused(self, task: ValidationTask) -> None:
+        self._validation_page.refresh_task()
+        self._set_application_state("验证已暂停")
+        self.update_header_status("mode", "验证已暂停", "warning")
+
+    def _validation_resumed(self, task: ValidationTask) -> None:
+        self._validation_page.refresh_task()
+        self._set_application_state("模型验证中")
+        self.update_header_status("mode", "模型验证中", "active")
+
+    def _validation_terminal(self, task: ValidationTask) -> None:
+        page = self._validation_page
+        page.show_validation_complete(task)
+        self._set_validation_ui_locked(False)
+        self._set_application_state("正常")
+        self.update_header_status("mode", "本地", "neutral")
+        self._run_task(
+            lambda: self.validation_service.export_results(task),
+            "验证结果自动导出",
+            page.show_export_result,
+            page.show_error,
+        )
+
+    def _validation_fatal(self, message: str) -> None:
+        page = self._validation_page
+        page.show_error(f"验证任务已终止：{message}")
+        self._set_validation_ui_locked(False)
+        self._set_application_state("推理失败")
+        self.update_header_status("mode", "本地", "neutral")
+        if self.validation_task is not None:
+            self._run_task(
+                lambda: self.validation_service.export_results(self.validation_task),
+                "验证失败结果导出",
+                page.show_export_result,
+                page.show_error,
+            )
+
+    def _validation_worker_finished(self) -> None:
+        self.validation_worker = None
+        self._validation_page.refresh_task()
+
+    def _open_validation_history(self, directory: Path) -> None:
+        page = self._validation_page
+        page.progress_label.setText("正在读取历史验证结果…")
+
+        def loaded(task: ValidationTask) -> None:
+            self.validation_task = task
+            page.show_history(task)
+
+        self._run_task(
+            lambda: self.validation_service.load_history(directory),
+            "打开历史验证结果",
+            loaded,
+            page.show_error,
+        )
+
+    def _validate_existing_batch(self, directory: Path) -> None:
+        page = self._validation_page
+        if self.loaded_model is None or page.report is None:
+            page.show_error("请先激活模型并检查验证清单。")
+            return
+        locked_model = self.loaded_model
+        report = page.report
+        page.progress_label.setText("正在关联已有批量结果与真实标签…")
+
+        def completed(task: ValidationTask) -> None:
+            self.validation_task = task
+            page.show_validation_complete(task)
+            self._run_task(
+                lambda: self.validation_service.export_results(task),
+                "已有批量结果验证导出",
+                page.show_export_result,
+                page.show_error,
+            )
+
+        self._run_task(
+            lambda: self.validation_service.validate_existing_batch(
+                directory,
+                report,
+                locked_model,
+            ),
+            "已有批量结果转验证",
+            completed,
+            page.show_error,
+        )
+
+    def _preview_validation_sample(self, source_path: Path) -> None:
+        page = self._validation_page
+        self._run_task(
+            lambda: self.prediction_service.preview_file(source_path),
+            "验证样本波形按需读取",
+            page.show_preview,
+            page.show_preview_error,
+        )
+
+    def _export_validation_copy(self, destination: Path) -> None:
+        if self.validation_task is None:
+            return
+        page = self._validation_page
+        self._run_task(
+            lambda: self.validation_service.export_results(
+                self.validation_task,
+                destination=destination,
+            ),
+            "验证报告副本导出",
+            page.show_export_result,
+            page.show_error,
+        )
+
+    def _set_validation_ui_locked(self, locked: bool) -> None:
+        self._single_prediction_page.setEnabled(not locked)
+        self._batch_prediction_page.setEnabled(not locked)
+        self._model_page.set_busy(locked, "模型验证期间当前模型已锁定。" if locked else "")
+        self._settings_page.set_device_switch_locked(
+            locked,
+            "当前模型验证正在使用计算设备，请完成或停止任务后再切换。"
+            if locked
+            else "",
+        )
+        self._validation_page.refresh_task()

@@ -6,9 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
+from noise_source_studio.common.exceptions import ModelActivationError
 from noise_source_studio.common.paths import ApplicationPaths
 from noise_source_studio.infrastructure.config import SettingsManager
 from noise_source_studio.infrastructure.inference import RuntimeAdapter
@@ -68,6 +70,54 @@ def test_switching_model_closes_previous_session(tmp_path: Path) -> None:
     assert first.closed
     assert adapter.has_session
     assert not FakeSession.created[-1].closed
+
+
+def test_failed_candidate_load_retains_previous_session(tmp_path: Path) -> None:
+    class SelectiveSession(FakeSession):
+        @classmethod
+        def load_model(cls, checkpoint: Path, *, device: str) -> FakeSession:
+            if Path(checkpoint).parent.name == "broken":
+                raise RuntimeError("CUDA candidate failed")
+            return cls(Path(checkpoint), device)
+
+    runtime = _fake_runtime()
+    runtime.InferenceSession = SelectiveSession
+    FakeSession.created.clear()
+    adapter = RuntimeAdapter(runtime)
+    adapter.load_model(tmp_path / "working", device="cpu")
+    previous = FakeSession.created[-1]
+
+    with pytest.raises(ModelActivationError):
+        adapter.load_model(tmp_path / "broken", device="cuda:0")
+
+    assert adapter.has_session
+    assert not previous.closed
+    assert adapter.inspect_model()["device"] == "cpu"
+
+
+def test_successful_candidate_closes_old_session_only_after_inspection(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class OrderedSession(FakeSession):
+        def inspect_model(self) -> dict[str, Any]:
+            events.append(f"inspect:{self.checkpoint.parent.name}")
+            return super().inspect_model()
+
+        def close(self) -> None:
+            events.append(f"close:{self.checkpoint.parent.name}")
+            super().close()
+
+    runtime = _fake_runtime()
+    runtime.InferenceSession = OrderedSession
+    FakeSession.created.clear()
+    adapter = RuntimeAdapter(runtime)
+    adapter.load_model(tmp_path / "old")
+
+    adapter.load_model(tmp_path / "new")
+
+    assert events.index("inspect:new") < events.index("close:old")
 
 
 def test_close_releases_retained_session(tmp_path: Path) -> None:

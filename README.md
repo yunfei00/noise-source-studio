@@ -1,5 +1,21 @@
 # Noise Source Studio
 
+## Phase 4：模型验证中心
+
+模型验证页面已经提供完整的 manifest 驱动验证流程，并继续复用当前激活模型的单一
+`InferenceSession`：
+
+- “验证配置 / 总体结果 / 标签分析 / 组合分析 / 分组分析 / 样本明细”六个页签；
+- UTF-8 BOM 清单、中文路径、相对/绝对路径、动态模型标签列和附加元数据；
+- 后台顺序推理、逐文件错误隔离、暂停、继续、停止和模型/设备锁定；
+- Exact Match、Micro/Macro/Weighted 指标、Hamming Loss、标签 TP/FP/TN/FN、
+  组合混淆矩阵、Structured Top-K 和动态分组指标；
+- 10,000 条结果虚拟表格、典型误判筛选、图表/矩阵联动和按需波形；
+- 历史验证恢复、已有批量结果转验证，以及不依赖外部网络资源的 `report.html`。
+
+验证清单格式、指标分母和输出文件说明见
+[验证数据契约](docs/validation_manifest.md)。
+
 Noise Source Studio（噪声源智能识别平台）是一款面向噪声源多标签识别的 Windows
 桌面应用。当前 Phase 3 已在冻结的商业 GUI 框架上完成模型包管理、单文件推理和专业批量预测。
 
@@ -110,6 +126,21 @@ outputs/
 CSV 使用 UTF-8 BOM；列表和字典字段保存为合法 JSON 字符串。导出失败不会清除内存结果，可重新
 选择目录导出副本。
 
+## 计算设备
+
+- 系统设置提供自动选择、CPU 和实际探测到的 `CUDA:N`，并持久化
+  `device_preference` 与 `allow_cpu_fallback`。
+- 自动模式会在后台对每个 CUDA 执行设备名称、tensor 计算和 synchronize 完整探测；探测失败时
+  使用 CPU，并显示非阻塞回退提示。
+- 明确选择 CPU 时不会运行 CUDA 探测，也不会被已安装的 CUDA 环境覆盖。
+- 明确选择 CUDA 时不会静默回退；用户可以选择切换到 CPU、取消或查看日志。
+- 顶部状态显示当前 session 的实际设备，而不是配置策略或 PyTorch CUDA 构建版本。
+- 设备切换使用“候选 session 成功后原子替换，再关闭旧 session”，失败时保留旧 session。
+- 单文件、批量、模型验证及模型加载期间禁止切换设备。
+
+完整契约和当前 runtime 兼容说明见
+[`docs/device_selection.md`](docs/device_selection.md)。
+
 ## 质量检查
 
 ```powershell
@@ -140,6 +171,7 @@ python -m pytest tests\integration\test_batch_consistency.py
 
 - 商业浅色主窗口、顶部状态、八个主页面、统一导航和高 DPI SVG 图标
 - JSON 配置、平台用户数据目录、轮转日志和全局异常处理
+- 后台 CPU/CUDA 完整探测、设备策略持久化、CPU 回退和 session 原子切换
 - 模型包校验、原子导入、注册、激活、恢复、完整性复查和安全删除
 - 单一长期 `InferenceSession` 与 runtime 适配层
 - 单文件严格 CSV 解析、信号预览、后台推理、动态结果展示和显式导出
@@ -149,7 +181,6 @@ python -m pytest tests\integration\test_batch_consistency.py
 
 ## 尚未实现
 
-- 完整模型验证指标、混淆矩阵、Precision、Recall 和 F1
 - SQLite 任务历史与未完成任务自动恢复
 - 多线程模型 forward、多 GPU 和远程推理
 - 用户权限、自动更新和安装包

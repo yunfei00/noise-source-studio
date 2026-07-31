@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from noise_source_studio.common.exceptions import InferenceEngineNotConfiguredError
+from noise_source_studio.domain.device import DeviceProbeReport
 from noise_source_studio.domain.models import SignalPreview
 
 ERROR_MESSAGE = "推理引擎尚未配置，请先导入兼容模型。"
@@ -26,6 +27,10 @@ class UnconfiguredInferenceEngine:
         """Reject model loading because no concrete adapter is available."""
         del model_path, device
         raise InferenceEngineNotConfiguredError(ERROR_MESSAGE)
+
+    def probe_devices(self) -> DeviceProbeReport:
+        """Expose CPU even when no concrete runtime is configured."""
+        return DeviceProbeReport.cpu_only(error_message=ERROR_MESSAGE)
 
     def inspect_model(self) -> NoReturn:
         """Reject session inspection while no adapter exists."""

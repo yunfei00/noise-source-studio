@@ -5,16 +5,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Condition
 from time import perf_counter
 from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
-from noise_source_studio.common.exceptions import (
-    InferenceEngineNotConfiguredError,
-    PredictionBusyError,
-)
 from noise_source_studio.domain.batch import (
     BatchFileItem,
     BatchItemStatus,
@@ -22,6 +17,10 @@ from noise_source_studio.domain.batch import (
     BatchStatus,
 )
 from noise_source_studio.domain.interfaces import InferenceEngine
+from noise_source_studio.infrastructure.inference.worker_control import (
+    CooperativeWorkerControl,
+    is_fatal_inference_error,
+)
 from noise_source_studio.services.result_adapter import (
     display_probabilities,
     normalize_prediction_result,
@@ -55,27 +54,19 @@ class BatchWorker(QRunnable):
         self.engine = engine
         self.task = task
         self.signals = BatchWorkerSignals()
-        self._condition = Condition()
-        self._pause_requested = False
-        self._stop_requested = False
+        self._control = CooperativeWorkerControl()
 
     def request_pause(self) -> None:
         """Pause at the next file boundary."""
-        with self._condition:
-            self._pause_requested = True
+        self._control.request_pause()
 
     def request_resume(self) -> None:
         """Wake a paused worker without resetting any successful item."""
-        with self._condition:
-            self._pause_requested = False
-            self._condition.notify_all()
+        self._control.request_resume()
 
     def request_stop(self) -> None:
         """Cooperatively stop after the current inference returns."""
-        with self._condition:
-            self._stop_requested = True
-            self._pause_requested = False
-            self._condition.notify_all()
+        self._control.request_stop()
         if self.task.status in {BatchStatus.RUNNING, BatchStatus.PAUSED}:
             self.task.status = BatchStatus.STOPPING
 
@@ -140,21 +131,17 @@ class BatchWorker(QRunnable):
         self.signals.batch_completed.emit(self.task)
 
     def _wait_at_boundary(self) -> bool:
-        with self._condition:
-            if self._stop_requested:
-                return True
-            if self._pause_requested:
-                self.task.status = BatchStatus.PAUSED
-                LOGGER.info("Batch paused | task_id=%s", self.task.task_id)
-                self.signals.batch_paused.emit(self.task)
-                while self._pause_requested and not self._stop_requested:
-                    self._condition.wait()
-                if self._stop_requested:
-                    return True
-                self.task.status = BatchStatus.RUNNING
-                LOGGER.info("Batch resumed | task_id=%s", self.task.task_id)
-                self.signals.batch_resumed.emit(self.task)
-            return self._stop_requested
+        def paused() -> None:
+            self.task.status = BatchStatus.PAUSED
+            LOGGER.info("Batch paused | task_id=%s", self.task.task_id)
+            self.signals.batch_paused.emit(self.task)
+
+        def resumed() -> None:
+            self.task.status = BatchStatus.RUNNING
+            LOGGER.info("Batch resumed | task_id=%s", self.task.task_id)
+            self.signals.batch_resumed.emit(self.task)
+
+        return self._control.wait_at_boundary(paused, resumed)
 
     def _run_item(self, item: BatchFileItem) -> bool:
         item.started_at = datetime.now(UTC)
@@ -286,22 +273,7 @@ class BatchWorker(QRunnable):
 
     @staticmethod
     def _is_fatal(exc: Exception) -> bool:
-        if isinstance(exc, (InferenceEngineNotConfiguredError, PredictionBusyError)):
-            return True
-        message = str(exc).casefold()
-        return any(
-            marker in message
-            for marker in (
-                "session closed",
-                "会话已关闭",
-                "没有已加载",
-                "没有已激活",
-                "cuda device",
-                "cuda 设备",
-                "model state corrupted",
-                "模型内部状态",
-            )
-        )
+        return is_fatal_inference_error(exc)
 
 
 __all__ = ["BatchWorker", "BatchWorkerSignals"]
