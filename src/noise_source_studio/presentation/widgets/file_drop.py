@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from pathlib import Path
+
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
@@ -12,14 +15,20 @@ class FileDropZone(QWidget):
 
     browse_requested = Signal()
     file_dropped = Signal(str)
+    file_rejected = Signal(str)
 
     def __init__(
         self,
         title: str = "拖放文件到此处",
         description: str = "或从本机选择一个文件",
+        accepted_extensions: Iterable[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.accepted_extensions = {
+            extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+            for extension in (accepted_extensions or ())
+        }
         self.setObjectName("fileDropZone")
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
@@ -41,14 +50,24 @@ class FileDropZone(QWidget):
         layout.addStretch()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
-        """Accept drags containing at least one local file."""
-        if event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
+        """Accept drags containing at least one supported local file."""
+        if event.mimeData().hasUrls() and any(
+            url.isLocalFile() and self._is_supported(url.toLocalFile())
+            for url in event.mimeData().urls()
+        ):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
         """Emit the first dropped local file path."""
         for url in event.mimeData().urls():
             if url.isLocalFile():
-                self.file_dropped.emit(url.toLocalFile())
-                event.acceptProposedAction()
+                local_path = url.toLocalFile()
+                if self._is_supported(local_path):
+                    self.file_dropped.emit(local_path)
+                    event.acceptProposedAction()
+                else:
+                    self.file_rejected.emit(local_path)
                 return
+
+    def _is_supported(self, path: str) -> bool:
+        return not self.accepted_extensions or Path(path).suffix.lower() in self.accepted_extensions

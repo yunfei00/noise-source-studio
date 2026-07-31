@@ -13,12 +13,17 @@ authors = [{ name = "Noise Source Studio Team" }]
 dependencies = [
     "PySide6>=6.6,<7",
     "platformdirs>=4.2,<5",
+    "packaging>=24,<27",
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.2,<3",
     "pyqtgraph>=0.13.7,<1",
 ]
 
 [project.optional-dependencies]
+inference = [
+    "numpy>=2,<3",
+    "torch>=2.2",
+]
 dev = [
     "pytest>=8.2,<9",
     "pytest-qt>=4.4,<5",

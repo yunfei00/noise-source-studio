@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
@@ -18,7 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from noise_source_studio.domain.interfaces import InferenceEngine
+from noise_source_studio.domain.models import LoadedModel, ModelRecord, PredictionOutcome
 from noise_source_studio.infrastructure.config import AppSettings, SettingsManager
+from noise_source_studio.infrastructure.inference import RuntimeAdapter
 from noise_source_studio.presentation.navigation import NAVIGATION_ITEMS, NavigationSidebar
 from noise_source_studio.presentation.pages import (
     BatchPredictionPage,
@@ -30,7 +38,11 @@ from noise_source_studio.presentation.pages import (
     SinglePredictionPage,
     ValidationPage,
 )
+from noise_source_studio.services import ModelService, PredictionService
+from noise_source_studio.services.tasks import BackgroundTask, TaskFailure
 from noise_source_studio.version import APPLICATION_TITLE
+
+LOGGER = logging.getLogger("noise_source_studio.main_window")
 
 
 class HeaderStatusUnit(QFrame):
@@ -75,11 +87,28 @@ class MainWindow(QMainWindow):
         settings: AppSettings,
         settings_manager: SettingsManager,
         log_file: Path,
+        engine: InferenceEngine | None = None,
+        model_service: ModelService | None = None,
+        prediction_service: PredictionService | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.header_statuses: dict[str, HeaderStatusUnit] = {}
+        self.engine = engine or RuntimeAdapter()
+        self.model_service = model_service or ModelService(
+            settings.model_directory,
+            self.engine,
+        )
+        self.prediction_service = prediction_service or PredictionService(
+            self.engine,
+            settings.output_directory,
+        )
+        self.loaded_model: LoadedModel | None = None
+        self.task_pool = QThreadPool(self)
+        self.task_pool.setMaxThreadCount(1)
+        self._tasks: set[BackgroundTask] = set()
+        self._shutting_down = False
         self.setObjectName("mainWindow")
         self.setWindowTitle(APPLICATION_TITLE)
         self.setMinimumSize(1180, 720)
@@ -114,8 +143,15 @@ class MainWindow(QMainWindow):
         if isinstance(dashboard, DashboardPage):
             dashboard.navigation_requested.connect(self.navigation.select_page)
 
+        self._connect_runtime_pages()
         self._build_status_bar()
+        self._refresh_model_views()
         self.set_current_page(0)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown)
+        if self.model_service.active_model() is not None:
+            QTimer.singleShot(0, self._restore_active_model)
 
     @property
     def page_count(self) -> int:
@@ -140,6 +176,19 @@ class MainWindow(QMainWindow):
         except KeyError as exc:
             raise KeyError(f"Unknown header status: {status_key}") from exc
         status.set_status(value, state)
+
+    def shutdown(self) -> None:
+        """Wait briefly for background work and always close the retained session."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.task_pool.waitForDone()
+        self.engine.close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        """Release runtime resources before the window is destroyed."""
+        self.shutdown()
+        super().closeEvent(event)
 
     def _create_pages(
         self,
@@ -183,12 +232,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(product)
         layout.addStretch()
         status_definitions = (
-            ("model", "当前模型", "未配置", "warning"),
-            ("device", "计算设备", "待检测", "neutral"),
-            ("mode", "工作模式", "本地", "neutral"),
+            ("model", "当前模型", "未配置", "warning", 220),
+            ("device", "计算设备", "待检测", "neutral", 120),
+            ("mode", "工作模式", "本地", "neutral", 120),
         )
-        for key, label, value, state in status_definitions:
+        for key, label, value, state, minimum_width in status_definitions:
             status = HeaderStatusUnit(label, value, state)
+            status.setMinimumWidth(minimum_width)
             self.header_statuses[key] = status
             layout.addWidget(status)
         return header
@@ -201,8 +251,8 @@ class MainWindow(QMainWindow):
 
         version = QLabel(f"版本 {self.settings.application_version}")
         version.setObjectName("footerText")
-        ready = QLabel("●  应用正常")
-        ready.setObjectName("readyStatus")
+        self.application_state_label = QLabel("●  应用正常")
+        self.application_state_label.setObjectName("readyStatus")
         self.current_page_label = QLabel()
         self.current_page_label.setObjectName("footerText")
         self.clock_label = QLabel()
@@ -210,7 +260,7 @@ class MainWindow(QMainWindow):
         self.clock_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
 
         status_bar.addWidget(version)
-        status_bar.addWidget(ready)
+        status_bar.addWidget(self.application_state_label)
         status_bar.addPermanentWidget(self.current_page_label)
         status_bar.addPermanentWidget(self.clock_label)
 
@@ -222,3 +272,304 @@ class MainWindow(QMainWindow):
 
     def _update_clock(self) -> None:
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+
+    def _connect_runtime_pages(self) -> None:
+        model_page = self._model_page
+        model_page.package_selected.connect(self._inspect_model_package)
+        model_page.package_import_requested.connect(self._import_model_package)
+        model_page.activation_requested.connect(self._activate_model)
+        model_page.deletion_requested.connect(self._delete_model)
+        model_page.integrity_requested.connect(self._check_model_integrity)
+
+        prediction_page = self._single_prediction_page
+        prediction_page.preview_requested.connect(self._preview_file)
+        prediction_page.prediction_requested.connect(self._predict_file)
+        prediction_page.export_requested.connect(self._export_prediction)
+
+    @property
+    def _dashboard_page(self) -> DashboardPage:
+        page = self.pages[0]
+        assert isinstance(page, DashboardPage)
+        return page
+
+    @property
+    def _single_prediction_page(self) -> SinglePredictionPage:
+        page = self.pages[1]
+        assert isinstance(page, SinglePredictionPage)
+        return page
+
+    @property
+    def _model_page(self) -> ModelManagementPage:
+        page = self.pages[4]
+        assert isinstance(page, ModelManagementPage)
+        return page
+
+    def _run_task(
+        self,
+        operation: Any,
+        description: str,
+        on_success: Any,
+        on_error: Any,
+        on_finished: Any | None = None,
+    ) -> None:
+        if self._shutting_down:
+            return
+        task = BackgroundTask(operation, description)
+        self._tasks.add(task)
+        task.signals.succeeded.connect(on_success)
+        task.signals.failed.connect(
+            lambda failure, context=description, task_id=task.task_id: self._dispatch_task_error(
+                context,
+                task_id,
+                failure,
+                on_error,
+            )
+        )
+
+        def finish() -> None:
+            self._tasks.discard(task)
+            if on_finished is not None:
+                on_finished()
+
+        task.signals.finished.connect(finish)
+        self.task_pool.start(task)
+
+    def _dispatch_task_error(
+        self,
+        context: str,
+        task_id: str,
+        failure: TaskFailure,
+        handler: Any,
+    ) -> None:
+        LOGGER.error(
+            "Background task failed | task=%s | task_id=%s | exception=%s | traceback=%s",
+            context,
+            task_id,
+            type(failure.exception).__name__,
+            failure.traceback_text,
+        )
+        handler(str(failure.exception))
+
+    def _inspect_model_package(self, package_path: Path) -> None:
+        page = self._model_page
+        page.set_busy(True, "正在后台校验模型包…")
+        self._run_task(
+            lambda: self.model_service.inspect_package(package_path),
+            "模型包校验",
+            page.show_package_inspection,
+            lambda message: page.show_feedback(message, error=True),
+            lambda: page.set_busy(False),
+        )
+
+    def _import_model_package(self, package_path: Path) -> None:
+        page = self._model_page
+        page.set_busy(True, "正在复制并二次校验模型包…")
+
+        def imported(record: ModelRecord) -> None:
+            self._refresh_model_views()
+            page.show_feedback(f"模型已导入：{record.display_name}", error=False)
+
+        self._run_task(
+            lambda: self.model_service.import_package(package_path),
+            "模型包导入",
+            imported,
+            lambda message: page.show_feedback(message, error=True),
+            lambda: page.set_busy(False),
+        )
+
+    def _activate_model(self, identifier: str) -> None:
+        page = self._model_page
+        page.set_busy(True, "正在后台加载模型…")
+        self._set_application_state("模型加载中")
+        self.update_header_status("model", "加载中", "warning")
+
+        def activated(loaded: LoadedModel) -> None:
+            self._apply_loaded_model(loaded)
+            self._refresh_model_views()
+            page.show_feedback(f"模型已激活：{loaded.record.display_name}", error=False)
+
+        def failed(message: str) -> None:
+            self._clear_loaded_model(load_failed=True)
+            self._refresh_model_views()
+            page.show_feedback(message, error=True)
+            QMessageBox.warning(self, "模型加载失败", message)
+
+        self._run_task(
+            lambda: self.model_service.activate_model(
+                identifier,
+                device=self.settings.default_device,
+            ),
+            "模型激活",
+            activated,
+            failed,
+            lambda: page.set_busy(False),
+        )
+
+    def _restore_active_model(self) -> None:
+        record = self.model_service.active_model()
+        if record is None:
+            return
+        self._set_application_state("模型加载中")
+        self.update_header_status("model", "加载中", "warning")
+
+        def failed(message: str) -> None:
+            self._clear_loaded_model(load_failed=True)
+            self._refresh_model_views()
+            QMessageBox.warning(
+                self,
+                "活动模型恢复失败",
+                f"{message}\n\n应用已恢复到安全的未配置状态。",
+            )
+
+        self._run_task(
+            lambda: self.model_service.activate_model(
+                record.identifier,
+                device=self.settings.default_device,
+            ),
+            "启动恢复活动模型",
+            self._apply_loaded_model,
+            failed,
+        )
+
+    def _delete_model(self, identifier: str) -> None:
+        page = self._model_page
+        page.set_busy(True, "正在删除未激活模型…")
+
+        def deleted(_: object) -> None:
+            self._refresh_model_views()
+            page.show_feedback("模型已删除。", error=False)
+
+        self._run_task(
+            lambda: self.model_service.delete_model(identifier),
+            "模型删除",
+            deleted,
+            lambda message: page.show_feedback(message, error=True),
+            lambda: page.set_busy(False),
+        )
+
+    def _check_model_integrity(self, identifier: str) -> None:
+        page = self._model_page
+        page.set_busy(True, "正在后台执行完整性校验…")
+
+        def checked(_: object) -> None:
+            self._refresh_model_views()
+            page.show_feedback("完整性校验通过。", error=False)
+
+        self._run_task(
+            lambda: self.model_service.check_integrity(identifier),
+            "模型完整性校验",
+            checked,
+            lambda message: page.show_feedback(message, error=True),
+            lambda: page.set_busy(False),
+        )
+
+    def _preview_file(self, source_path: Path) -> None:
+        page = self._single_prediction_page
+        self._run_task(
+            lambda: self.prediction_service.preview_file(source_path),
+            "CSV 信号解析",
+            page.show_preview,
+            page.show_preview_error,
+        )
+
+    def _predict_file(self, source_path: Path) -> None:
+        record = self.model_service.active_model()
+        if record is None or self.loaded_model is None:
+            self._single_prediction_page.show_prediction_error("当前没有已加载的活动模型。")
+            return
+        locked_record = record
+        page = self._single_prediction_page
+        page.begin_prediction()
+        self._set_application_state("推理中")
+
+        def completed(outcome: PredictionOutcome) -> None:
+            page.show_prediction(outcome)
+            self._set_application_state("正常")
+
+        def failed(message: str) -> None:
+            page.show_prediction_error(message)
+            self._set_application_state("推理失败")
+
+        self._run_task(
+            lambda: self.prediction_service.predict_file(
+                source_path,
+                locked_record,
+            ),
+            "单文件推理",
+            completed,
+            failed,
+        )
+
+    def _export_prediction(self, include_contract: bool) -> None:
+        outcome = self._single_prediction_page.current_outcome
+        if outcome is None:
+            return
+        page = self._single_prediction_page
+        self._run_task(
+            lambda: self.prediction_service.export_result(
+                outcome,
+                include_contract=include_contract,
+            ),
+            "结果导出",
+            lambda paths: page.show_export_result(paths[0], paths[1]),
+            page.show_export_error,
+        )
+
+    def _apply_loaded_model(self, loaded: LoadedModel) -> None:
+        self.loaded_model = loaded
+        self.update_header_status("model", loaded.record.display_name, "active")
+        self.update_header_status("device", loaded.device, "active")
+        self.update_header_status("mode", "本地", "neutral")
+        dashboard = self._dashboard_page
+        dashboard.status_cards["model"].set_status(
+            loaded.record.display_name,
+            f"prediction mode：{loaded.prediction_mode}",
+        )
+        dashboard.status_cards["device"].set_status(
+            loaded.device,
+            f"runtime {loaded.runtime_version}",
+        )
+        self._single_prediction_page.set_model(loaded)
+        self._model_page.set_active_model(loaded.record, loaded.device)
+        self._set_application_state("正常")
+
+    def _clear_loaded_model(self, *, load_failed: bool = False) -> None:
+        self.loaded_model = None
+        self.engine.close()
+        self.update_header_status(
+            "model",
+            "加载失败" if load_failed else "未配置",
+            "warning",
+        )
+        self.update_header_status("device", "待检测", "neutral")
+        dashboard = self._dashboard_page
+        dashboard.status_cards["model"].set_status(
+            "加载失败" if load_failed else "未配置",
+            "请在模型管理中检查活动模型",
+        )
+        dashboard.status_cards["device"].set_status("待检测", "尚无可用模型会话")
+        self._single_prediction_page.set_model(None)
+        self._set_application_state("正常")
+
+    def _set_application_state(self, state: str) -> None:
+        notes = {
+            "正常": "基础服务与模型会话状态正常",
+            "模型加载中": "正在后台校验并创建模型会话",
+            "推理中": "正在后台执行单文件推理",
+            "推理失败": "最近一次推理失败，请查看系统日志",
+        }
+        self._dashboard_page.status_cards["application"].set_status(
+            state,
+            notes.get(state, ""),
+        )
+        self.application_state_label.setText(f"●  应用{state}")
+        self.application_state_label.setProperty(
+            "state",
+            "error" if state == "推理失败" else "active",
+        )
+        self.application_state_label.style().unpolish(self.application_state_label)
+        self.application_state_label.style().polish(self.application_state_label)
+
+    def _refresh_model_views(self) -> None:
+        records = self.model_service.list_models()
+        self._model_page.set_models(records)

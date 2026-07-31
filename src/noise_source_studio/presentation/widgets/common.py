@@ -128,12 +128,19 @@ class MetricCard(QFrame):
         label_widget.setObjectName("metricLabel")
         self.value_label = QLabel(value)
         self.value_label.setObjectName("metricValue")
+        self.note_label = QLabel(note)
+        self.note_label.setObjectName("metricNote")
+        self.note_label.setWordWrap(True)
         layout.addWidget(label_widget)
         layout.addWidget(self.value_label)
         if note:
-            note_widget = QLabel(note)
-            note_widget.setObjectName("metricNote")
-            layout.addWidget(note_widget)
+            layout.addWidget(self.note_label)
+
+    def set_status(self, value: str, note: str = "") -> None:
+        """Update a dashboard metric without rebuilding the frozen card layout."""
+        self.value_label.setText(value)
+        self.note_label.setText(note)
+        self.note_label.setVisible(bool(note))
 
 
 def create_table(headers: Iterable[str], minimum_height: int = 220) -> QTableWidget:

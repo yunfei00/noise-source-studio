@@ -340,10 +340,24 @@ QProgressBar::chunk {
     padding: 10px;
 }
 
+#warningBanner[error="true"] {
+    background: #fff0f0;
+    color: #a33131;
+    border-color: #e5b6b6;
+}
+
 #statusWarning {
     background: #fff7e2;
     color: #94610f;
     border: 1px solid #efd89f;
+    border-radius: 3px;
+    padding: 4px 9px;
+}
+
+#statusSuccess {
+    background: #edf8f1;
+    color: #287347;
+    border: 1px solid #b9ddc7;
     border-radius: 3px;
     padding: 4px 9px;
 }
@@ -389,8 +403,30 @@ QTabBar::tab:selected {
     color: #2d7c4b;
 }
 
-#settingsFeedback[error="true"] {
+#settingsFeedback[error="true"],
+#operationFeedback[error="true"] {
     color: #b23b3b;
+}
+
+#operationFeedback {
+    color: #2d7c4b;
+}
+
+#pathValue {
+    color: #667285;
+    background: #f7f9fb;
+    border: 1px solid #e1e5ea;
+    padding: 8px;
+}
+
+#manifestView,
+#predictionDetails {
+    background: #f8fafc;
+    color: #354256;
+    border: 1px solid #dfe4ea;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 11px;
+    padding: 7px;
 }
 
 #applicationStatusBar {
@@ -411,6 +447,10 @@ QTabBar::tab:selected {
 #readyStatus {
     color: #2d7c4b;
     font-size: 11px;
+}
+
+#readyStatus[state="error"] {
+    color: #b23b3b;
 }
 
 QScrollBar:vertical {
