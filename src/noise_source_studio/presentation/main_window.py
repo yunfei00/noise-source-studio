@@ -23,10 +23,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from noise_source_studio.domain.batch import (
+    RUNNING_BATCH_STATUSES,
+    BatchPredictionTask,
+    BatchStatus,
+)
 from noise_source_studio.domain.interfaces import InferenceEngine
 from noise_source_studio.domain.models import LoadedModel, ModelRecord, PredictionOutcome
 from noise_source_studio.infrastructure.config import AppSettings, SettingsManager
-from noise_source_studio.infrastructure.inference import RuntimeAdapter
+from noise_source_studio.infrastructure.inference import BatchWorker, RuntimeAdapter
 from noise_source_studio.presentation.navigation import NAVIGATION_ITEMS, NavigationSidebar
 from noise_source_studio.presentation.pages import (
     BatchPredictionPage,
@@ -38,7 +43,11 @@ from noise_source_studio.presentation.pages import (
     SinglePredictionPage,
     ValidationPage,
 )
-from noise_source_studio.services import ModelService, PredictionService
+from noise_source_studio.services import (
+    BatchPredictionService,
+    ModelService,
+    PredictionService,
+)
 from noise_source_studio.services.tasks import BackgroundTask, TaskFailure
 from noise_source_studio.version import APPLICATION_TITLE
 
@@ -90,6 +99,7 @@ class MainWindow(QMainWindow):
         engine: InferenceEngine | None = None,
         model_service: ModelService | None = None,
         prediction_service: PredictionService | None = None,
+        batch_prediction_service: BatchPredictionService | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -104,6 +114,11 @@ class MainWindow(QMainWindow):
             self.engine,
             settings.output_directory,
         )
+        self.batch_prediction_service = batch_prediction_service or BatchPredictionService(
+            settings.output_directory,
+        )
+        self.batch_task = self.batch_prediction_service.create_task()
+        self.batch_worker: BatchWorker | None = None
         self.loaded_model: LoadedModel | None = None
         self.task_pool = QThreadPool(self)
         self.task_pool.setMaxThreadCount(1)
@@ -187,6 +202,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Release runtime resources before the window is destroyed."""
+        if self.batch_task.status in RUNNING_BATCH_STATUSES:
+            answer = QMessageBox.question(
+                self,
+                "批量任务仍在运行",
+                "退出将等待当前文件完成并安全停止批量任务。确定退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            if self.batch_worker is not None:
+                self.batch_worker.request_stop()
         self.shutdown()
         super().closeEvent(event)
 
@@ -286,6 +314,20 @@ class MainWindow(QMainWindow):
         prediction_page.prediction_requested.connect(self._predict_file)
         prediction_page.export_requested.connect(self._export_prediction)
 
+        batch_page = self._batch_prediction_page
+        batch_page.set_task(self.batch_task)
+        batch_page.paths_added.connect(self._batch_add_paths)
+        batch_page.remove_requested.connect(self._batch_remove_items)
+        batch_page.clear_requested.connect(self._batch_clear)
+        batch_page.deduplicate_requested.connect(self._batch_deduplicate)
+        batch_page.start_requested.connect(self._start_batch)
+        batch_page.pause_requested.connect(self._pause_batch)
+        batch_page.resume_requested.connect(self._resume_batch)
+        batch_page.stop_requested.connect(self._stop_batch)
+        batch_page.retry_requested.connect(self._retry_batch)
+        batch_page.export_requested.connect(self._export_batch_copy)
+        batch_page.logs_requested.connect(lambda: self.navigation.select_page(6))
+
     @property
     def _dashboard_page(self) -> DashboardPage:
         page = self.pages[0]
@@ -296,6 +338,12 @@ class MainWindow(QMainWindow):
     def _single_prediction_page(self) -> SinglePredictionPage:
         page = self.pages[1]
         assert isinstance(page, SinglePredictionPage)
+        return page
+
+    @property
+    def _batch_prediction_page(self) -> BatchPredictionPage:
+        page = self.pages[2]
+        assert isinstance(page, BatchPredictionPage)
         return page
 
     @property
@@ -530,6 +578,7 @@ class MainWindow(QMainWindow):
             f"runtime {loaded.runtime_version}",
         )
         self._single_prediction_page.set_model(loaded)
+        self._batch_prediction_page.set_model_available(True)
         self._model_page.set_active_model(loaded.record, loaded.device)
         self._set_application_state("正常")
 
@@ -549,6 +598,7 @@ class MainWindow(QMainWindow):
         )
         dashboard.status_cards["device"].set_status("待检测", "尚无可用模型会话")
         self._single_prediction_page.set_model(None)
+        self._batch_prediction_page.set_model_available(False)
         self._set_application_state("正常")
 
     def _set_application_state(self, state: str) -> None:
@@ -556,6 +606,8 @@ class MainWindow(QMainWindow):
             "正常": "基础服务与模型会话状态正常",
             "模型加载中": "正在后台校验并创建模型会话",
             "推理中": "正在后台执行单文件推理",
+            "批量推理中": "正在复用当前模型会话顺序执行批量任务",
+            "批量已暂停": "当前文件已完成，等待用户继续或停止",
             "推理失败": "最近一次推理失败，请查看系统日志",
         }
         self._dashboard_page.status_cards["application"].set_status(
@@ -573,3 +625,163 @@ class MainWindow(QMainWindow):
     def _refresh_model_views(self) -> None:
         records = self.model_service.list_models()
         self._model_page.set_models(records)
+
+    def _batch_add_paths(self, paths: list[Path], recursive: bool) -> None:
+        page = self._batch_prediction_page
+        page.show_feedback("正在扫描文件…")
+        self._run_task(
+            lambda: self.batch_prediction_service.add_paths(
+                self.batch_task,
+                paths,
+                recursive=recursive,
+            ),
+            "批量文件扫描",
+            page.show_scan_summary,
+            lambda message: page.show_feedback(message, error=True),
+        )
+
+    def _batch_remove_items(self, item_ids: list[str]) -> None:
+        self.batch_prediction_service.remove_items(self.batch_task, item_ids)
+        self._batch_prediction_page.refresh_table()
+
+    def _batch_clear(self) -> None:
+        self.batch_prediction_service.clear_items(self.batch_task)
+        self._batch_prediction_page.refresh_table()
+
+    def _batch_deduplicate(self) -> None:
+        removed = self.batch_prediction_service.deduplicate(self.batch_task)
+        page = self._batch_prediction_page
+        page.show_feedback(f"已移除 {removed} 个重复文件。")
+        page.refresh_table()
+
+    def _start_batch(self) -> None:
+        if self.loaded_model is None:
+            self._batch_prediction_page.show_feedback(
+                "请先在模型管理中激活模型。",
+                error=True,
+            )
+            return
+        if self.batch_task.status == BatchStatus.STOPPED:
+            self.batch_prediction_service.prepare_remaining(self.batch_task)
+        if not any(item.status.value == "pending" for item in self.batch_task.items):
+            self._batch_prediction_page.show_feedback("队列中没有待处理文件。", error=True)
+            return
+        locked_identifier = (
+            f"{self.batch_task.model_name}@{self.batch_task.model_version}"
+            if self.batch_task.model_name
+            else ""
+        )
+        if locked_identifier and locked_identifier != self.loaded_model.record.identifier:
+            self._batch_prediction_page.show_feedback(
+                f"该批次已锁定模型 {locked_identifier}，请重新激活此模型后继续；"
+                "如需使用新模型，请先清空队列创建新批次。",
+                error=True,
+            )
+            return
+        if not locked_identifier:
+            self.batch_prediction_service.lock_model(self.batch_task, self.loaded_model)
+        worker = BatchWorker(self.engine, self.batch_task)
+        self.batch_worker = worker
+        page = self._batch_prediction_page
+        worker.signals.batch_started.connect(page.refresh_summary)
+        worker.signals.item_started.connect(page.refresh_item)
+        worker.signals.item_progress.connect(lambda item, _message: page.refresh_item(item))
+        worker.signals.item_succeeded.connect(page.refresh_item)
+        worker.signals.item_failed.connect(page.refresh_item)
+        worker.signals.batch_progress.connect(page.refresh_summary)
+        worker.signals.batch_paused.connect(self._batch_paused)
+        worker.signals.batch_resumed.connect(self._batch_resumed)
+        worker.signals.batch_stopped.connect(self._batch_terminal)
+        worker.signals.batch_completed.connect(self._batch_terminal)
+        worker.signals.fatal_error.connect(self._batch_fatal)
+        worker.signals.finished.connect(self._batch_worker_finished)
+        self._set_batch_ui_locked(True)
+        self._set_application_state("批量推理中")
+        self.update_header_status("mode", "批量推理中", "active")
+        page.refresh_table()
+        self.task_pool.start(worker)
+
+    def _pause_batch(self) -> None:
+        if self.batch_worker is not None:
+            self.batch_worker.request_pause()
+            self._batch_prediction_page.show_pause_requested()
+
+    def _resume_batch(self) -> None:
+        if self.batch_worker is not None:
+            self.batch_worker.request_resume()
+
+    def _stop_batch(self) -> None:
+        if self.batch_worker is not None:
+            self.batch_worker.request_stop()
+            self._batch_prediction_page.show_feedback("正在完成当前文件并安全停止…")
+            self._batch_prediction_page.refresh_summary()
+
+    def _batch_paused(self, task: BatchPredictionTask) -> None:
+        self._set_application_state("批量已暂停")
+        self.update_header_status("mode", "批量已暂停", "warning")
+        self._batch_prediction_page.refresh_table()
+
+    def _batch_resumed(self, task: BatchPredictionTask) -> None:
+        self._set_application_state("批量推理中")
+        self.update_header_status("mode", "批量推理中", "active")
+        self._batch_prediction_page.refresh_table()
+
+    def _batch_terminal(self, task: BatchPredictionTask) -> None:
+        page = self._batch_prediction_page
+        page.current_file_label.setText(
+            "已安全停止，可继续剩余任务"
+            if task.status == BatchStatus.STOPPED
+            else "全部文件处理完成"
+        )
+        page.refresh_table()
+        self._set_batch_ui_locked(False)
+        self._set_application_state("正常")
+        self.update_header_status("mode", "本地", "neutral")
+        self._run_task(
+            lambda: self.batch_prediction_service.export_results(task),
+            "批量结果自动导出",
+            page.show_export_result,
+            lambda message: page.show_feedback(f"自动导出失败：{message}", error=True),
+        )
+
+    def _batch_fatal(self, message: str) -> None:
+        page = self._batch_prediction_page
+        page.current_file_label.setText("批量任务因不可恢复错误终止")
+        page.show_feedback(f"批量任务已终止：{message}", error=True)
+        self._set_batch_ui_locked(False)
+        self._set_application_state("推理失败")
+        self.update_header_status("mode", "本地", "neutral")
+        self._run_task(
+            lambda: self.batch_prediction_service.export_results(self.batch_task),
+            "批量致命错误结果导出",
+            page.show_export_result,
+            lambda error: page.show_feedback(f"错误结果导出失败：{error}", error=True),
+        )
+
+    def _batch_worker_finished(self) -> None:
+        self.batch_worker = None
+        self._batch_prediction_page.refresh_table()
+
+    def _retry_batch(self, item_ids: list[str] | None) -> None:
+        count = self.batch_prediction_service.retry_failed(self.batch_task, item_ids)
+        page = self._batch_prediction_page
+        page.show_feedback(f"已将 {count} 个失败项放回待处理队列。")
+        page.refresh_table()
+
+    def _export_batch_copy(self, destination: Path) -> None:
+        page = self._batch_prediction_page
+        self._run_task(
+            lambda: self.batch_prediction_service.export_results(
+                self.batch_task,
+                destination=destination,
+            ),
+            "批量结果导出副本",
+            page.show_export_result,
+            lambda message: page.show_feedback(message, error=True),
+        )
+
+    def _set_batch_ui_locked(self, locked: bool) -> None:
+        self._single_prediction_page.setEnabled(not locked)
+        self._model_page.set_busy(locked, "批量推理期间模型已锁定。" if locked else "")
+        self.pages[7].setEnabled(not locked)
+        self._batch_prediction_page.refresh_table()

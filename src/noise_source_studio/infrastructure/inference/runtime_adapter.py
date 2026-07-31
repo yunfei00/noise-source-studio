@@ -31,6 +31,7 @@ class RuntimeAdapter:
         self._session: Any | None = None
         self._session_lock = RLock()
         self._operation_lock = Lock()
+        self._model_load_count = 0
 
     @property
     def runtime_version(self) -> str:
@@ -43,6 +44,11 @@ class RuntimeAdapter:
         """Return whether a loaded session is currently retained."""
         with self._session_lock:
             return self._session is not None
+
+    @property
+    def model_load_count(self) -> int:
+        """Return successful session loads for diagnostics and stability checks."""
+        return self._model_load_count
 
     def verify_model_package(self, package_path: Path) -> dict[str, Any]:
         """Call the runtime package verifier and translate expected failures."""
@@ -74,6 +80,7 @@ class RuntimeAdapter:
                 raise ModelActivationError(self._model_load_message(exc)) from exc
             with self._session_lock:
                 self._session = session
+                self._model_load_count += 1
             return inspection
 
     def inspect_model(self) -> dict[str, Any]:

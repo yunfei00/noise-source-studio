@@ -37,6 +37,10 @@ from noise_source_studio.presentation.widgets import (
     PageHeader,
     SectionCard,
 )
+from noise_source_studio.services.result_adapter import (
+    normalize_prediction_result,
+    result_value,
+)
 
 
 class SinglePredictionPage(QWidget):
@@ -314,7 +318,7 @@ class SinglePredictionPage(QWidget):
         if self.selected_file != outcome.source_path:
             return
         self.current_outcome = outcome
-        result = outcome.result
+        result = normalize_prediction_result(outcome.result)
         labels = list(self._result_value(result, "labels", []))
         decision_mode = str(self._result_value(result, "decision_mode", "unknown"))
         probability_key = (
@@ -446,9 +450,7 @@ class SinglePredictionPage(QWidget):
 
     @staticmethod
     def _result_value(result: Any, key: str, default: Any) -> Any:
-        if isinstance(result, dict):
-            return result.get(key, default)
-        return getattr(result, key, default)
+        return result_value(result, key, default)
 
     @classmethod
     def _highest_combination_text(cls, result: Any) -> str:
@@ -464,7 +466,7 @@ class SinglePredictionPage(QWidget):
 
     @classmethod
     def _detail_payload(cls, outcome: PredictionOutcome) -> dict[str, Any]:
-        result = outcome.result
+        result = normalize_prediction_result(outcome.result)
         decision_mode = str(cls._result_value(result, "decision_mode", "unknown"))
         thresholds_applicable = bool(cls._result_value(result, "thresholds_applicable", False))
         decision = (

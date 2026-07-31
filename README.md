@@ -1,11 +1,10 @@
 # Noise Source Studio
 
-噪声源智能识别平台（Noise Source Studio）是一款面向噪声源多标签识别的 Windows
-桌面应用。当前 Phase 2 在冻结的商业 GUI 骨架上接入正式
-`noise_source_runtime`，支持模型包管理、长期模型会话和单 CSV 真实推理。
+Noise Source Studio（噪声源智能识别平台）是一款面向噪声源多标签识别的 Windows
+桌面应用。当前 Phase 3 已在冻结的商业 GUI 框架上完成模型包管理、单文件推理和专业批量预测。
 
-训练仓库实现、CSV 解析、STFT、模型结构和 PyTorch 细节不会复制到本仓库；
-GUI 仅通过单独交付的 runtime wheel 使用这些能力。
+训练仓库中的 CSV 解析、STFT、模型结构与 PyTorch 细节不会复制到本仓库。GUI 只通过独立交付的
+`noise_source_runtime` wheel 使用这些能力，并长期复用一个 `InferenceSession`。
 
 ## 环境要求
 
@@ -17,8 +16,6 @@ GUI 仅通过单独交付的 runtime wheel 使用这些能力。
 
 ## 创建开发环境
 
-在 PowerShell 中运行：
-
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -26,52 +23,36 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-如果 PowerShell 禁止执行激活脚本，可以直接使用
-`.\.venv\Scripts\python.exe` 执行后续命令。
+如果 PowerShell 禁止激活脚本，可直接使用 `.\.venv\Scripts\python.exe` 执行后续命令。
 
 ## 安装推理运行时
 
-1. 安装 GUI 项目：
+先根据设备安装兼容的 PyTorch，再安装训练侧交付的 runtime wheel：
 
-   ```powershell
-   python -m pip install -e ".[dev]"
-   ```
+```powershell
+python -m pip install -e ".[inference]"
+python -m pip install <交付目录>\runtime\noise_source_identification-0.1.0-py3-none-any.whl
+```
 
-2. 根据设备安装 PyTorch。CPU 环境可使用项目的通用可选依赖：
+CUDA 环境应使用 PyTorch 官方安装选择器生成的命令。本项目不锁定 CUDA wheel URL，也不提交模型文件。
 
-   ```powershell
-   python -m pip install -e ".[inference]"
-   ```
+## 启动
 
-   CUDA 环境请根据本机驱动和 CUDA 版本使用 PyTorch 官方安装选择器生成的命令。
-   本项目不锁定 CUDA wheel URL。
+```powershell
+python -m noise_source_studio
+```
 
-3. 安装训练侧交付的 runtime wheel。路径仅用于开发环境安装，不写入源码：
-
-   ```powershell
-   python -m pip install <交付目录>\runtime\noise_source_identification-0.1.0-py3-none-any.whl
-   ```
-
-   wheel 自身声明完整运行依赖；如果已经安装兼容的 CPU/CUDA PyTorch，pip 会复用它。
-
-4. 启动软件：
-
-   ```powershell
-   python -m noise_source_studio
-   ```
-
-安装后也可以使用：
+安装后也可运行：
 
 ```powershell
 noise-source-studio
 ```
 
-首次运行会在当前 Windows 用户的应用数据目录中创建配置、日志、模型和输出目录。
-运行数据、模型、注册表和推理结果不会写入源码目录。
+配置、日志、模型注册表和输出默认保存在当前 Windows 用户的应用数据目录，不写入源码目录。
 
 ## 模型包导入
 
-在“模型管理”页面选择包含以下文件的模型包目录：
+模型管理页接受包含以下文件的模型包目录：
 
 ```text
 model.pt
@@ -83,45 +64,53 @@ README.md
 sha256.txt
 ```
 
-应用通过 runtime 的 `verify_model_package` 校验结构和 SHA256，再检查 package schema、
-runtime 版本、动态标签和 prediction mode。导入采用：
+应用先调用 runtime 的 `verify_model_package` 校验结构和 SHA256，再检查 package schema、runtime
+版本、动态标签和 prediction mode。导入采用临时目录复制、二次校验、原子重命名和 JSON 注册流程。
+同一时间只有一个活动模型，活动模型会在后台加载并长期保留 session。
+
+## 单文件预测
+
+- 只接受满足 runtime 严格 DATA 契约的 `.csv` 文件。
+- 信号预览、CSV 解析和推理均在后台执行。
+- structured 主显示使用 `label_marginal_probabilities`，最终结论使用 runtime 返回的
+  `decoded_label_vector`、`predicted_combination` 和 `predicted_sources`。
+- multilabel 主显示使用 `multilabel_probabilities`，最终标签由 runtime 的实际 thresholds 判定。
+- 用户显式点击导出后才写 prediction JSON；inference contract 为可选项。
+
+## 批量预测
+
+- 支持多文件、文件夹、递归扫描、拖拽、自然排序、规范化绝对路径去重和队列编辑。
+- 文件夹扫描在后台执行；添加阶段仅做存在性、类型、后缀和可读性检查。
+- 一个批次锁定模型名称、版本、包路径、runtime 版本和设备，并复用当前已加载的 session。
+- 单工作线程按队列顺序调用 `session.predict_file`，不会为每个 CSV 重新加载模型，也不会并发
+  调用同一个 GPU session。
+- 暂停为协作式暂停：当前文件完成后暂停，不启动下一个文件；继续后只处理 pending 文件。
+- 停止为协作式停止：当前文件完成后停止，尚未运行的文件统一标记为 `stopped`。再次开始时可将
+  stopped 项恢复为 pending。
+- 单个 CSV 的解析或推理错误只标记该文件失败并继续；session 关闭、模型卸载、CUDA 设备失效等
+  不可恢复错误会终止批次。
+- 失败项可以单独或全部重试，`retry_count` 会保留。
+- 批次完成、停止或部分失败后自动写出：
 
 ```text
-临时目录复制 → 二次完整性校验 → 原子重命名 → JSON 注册
+outputs/
+└── batch_<日期时间>_<task-id>/
+    ├── summary.json
+    ├── predictions.csv
+    └── errors.csv
 ```
 
-同一名称和版本不会重复导入；复制或校验失败会清理临时目录。同一时间只能有一个活动
-模型。活动模型在后台加载并长期保留 session，切换模型和退出应用时会关闭旧 session。
-
-## 单文件推理
-
-- 仅接受 `.csv` 文件。
-- 文件必须满足 runtime 的严格 DATA 段契约。
-- 信号预览直接使用 runtime CSV 解析结果。
-- 大信号只对绘图数据抽样，不改变送入模型的原始数据。
-- 模型加载、CSV 解析和推理均通过 Qt 工作线程执行。
-- structured 模式显示 `label_marginal_probabilities`，最终组合完全由组合概率 argmax
-  和 `decoded_label_vector` 决定。
-- multilabel 模式显示 `multilabel_probabilities`，最终标签按各标签实际阈值执行
-  `probability >= threshold`。
-- 预测完成不会自动写报告；只有用户点击“导出结果”后才写 prediction JSON，可选同时
-  导出 inference contract。
+CSV 使用 UTF-8 BOM；列表和字典字段保存为合法 JSON 字符串。导出失败不会清除内存结果，可重新
+选择目录导出副本。
 
 ## 质量检查
 
-运行 Ruff：
-
 ```powershell
 python -m ruff check .
-```
-
-运行普通测试：
-
-```powershell
 python -m pytest
 ```
 
-真实黄金样本集成测试默认跳过。配置交付路径后运行：
+真实黄金样本测试：
 
 ```powershell
 $env:NOISE_STUDIO_MODEL_PACKAGE="<模型包目录>"
@@ -130,27 +119,32 @@ $env:NOISE_STUDIO_GOLDEN_RESULT="<golden_result.json>"
 python -m pytest tests\integration\test_golden_model.py
 ```
 
+真实三文件批量一致性测试：
+
+```powershell
+$env:NOISE_STUDIO_MODEL_PACKAGE="<模型包目录>"
+$env:NOISE_STUDIO_BATCH_CSV_DIR="<至少包含三个严格 DATA CSV 的目录>"
+python -m pytest tests\integration\test_batch_consistency.py
+```
+
+未配置环境变量时，真实集成测试会明确跳过；普通自动化测试使用 fake runtime，不要求 CUDA。
+
 ## 当前已实现
 
-- 专业浅色主题主窗口、顶部状态、八个主页面和统一导航
+- 商业浅色主窗口、顶部状态、八个主页面、统一导航和高 DPI SVG 图标
 - JSON 配置、平台用户数据目录、轮转日志和全局异常处理
-- 模型包校验、原子导入、JSON 注册、激活、完整性复查和未激活模型删除
-- 启动时后台恢复活动模型及顶部/工作台状态联动
-- runtime 适配层和单一长期 `InferenceSession`
-- Qt 后台模型加载、严格 CSV 解析和单文件推理
-- DATA 原始信号预览、解析统计和动态标签概率
-- structured/multilabel 两种结果语义与详细结果
-- 显式 prediction JSON 及可选 inference contract 导出
-- fake runtime 单元测试和环境变量驱动的黄金模型集成测试
+- 模型包校验、原子导入、注册、激活、恢复、完整性复查和安全删除
+- 单一长期 `InferenceSession` 与 runtime 适配层
+- 单文件严格 CSV 解析、信号预览、后台推理、动态结果展示和显式导出
+- 批量队列、后台扫描、顺序推理、暂停/继续/停止、错误隔离、失败重试和三文件导出
+- fake runtime 自动化测试和环境变量驱动的真实模型集成测试
 
 ## 尚未实现
 
-- 批量预测
-- 完整模型验证工作流
-- SQLite 任务历史
-- 多文件并发推理
-- 远程推理、用户权限和自动更新
-- 安装包
+- 完整模型验证指标、混淆矩阵、Precision、Recall 和 F1
+- SQLite 任务历史与未完成任务自动恢复
+- 多线程模型 forward、多 GPU 和远程推理
+- 用户权限、自动更新和安装包
 
 ## 项目目录
 
@@ -159,15 +153,15 @@ noise-source-studio/
 ├── src/noise_source_studio/
 │   ├── application.py             # Qt 应用生命周期与异常处理
 │   ├── common/                    # 公共异常和平台路径
-│   ├── domain/                    # GUI 稳定数据模型与接口
+│   ├── domain/                    # 稳定领域模型、批量状态与接口
 │   ├── infrastructure/
 │   │   ├── config/                # JSON 配置
-│   │   ├── inference/             # runtime wheel 适配层
+│   │   ├── inference/             # runtime 适配层与批量 worker
 │   │   └── logging/               # 轮转日志
-│   ├── services/                  # 模型、预测和后台任务编排
+│   ├── services/                  # 模型、单文件/批量预测与导出编排
 │   └── presentation/              # 主窗口、页面、组件、图标和样式
 ├── tests/
-│   └── integration/               # 可选黄金模型测试
+│   └── integration/               # 可选真实模型测试
 ├── pyproject.toml
 ├── CHANGELOG.md
 └── README.md

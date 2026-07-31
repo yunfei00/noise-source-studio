@@ -42,6 +42,7 @@ noise_source_studio = ["presentation/icons/*.svg", "presentation/styles/*.qss"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --basetemp=.test-runtime"
+markers = ["integration: opt-in tests using the separately delivered real runtime and model"]
 
 [tool.ruff]
 target-version = "py311"
