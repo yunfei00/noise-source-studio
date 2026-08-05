@@ -149,6 +149,35 @@ class BatchPredictionTask:
         finished = sum(counts[status] for status in TERMINAL_ITEM_STATUSES)
         self.progress = finished / self.total_count * 100.0 if self.total_count else 0.0
 
+    def transition_item_status(
+        self,
+        item: BatchFileItem,
+        status: BatchItemStatus,
+    ) -> None:
+        """Update one item and the cached counters without rescanning the batch."""
+        previous = item.status
+        if previous == status:
+            return
+        self._adjust_status_count(previous, -1)
+        item.status = status
+        self._adjust_status_count(status, 1)
+        finished = self.success_count + self.failed_count + self.skipped_count + self.stopped_count
+        self.progress = finished / self.total_count * 100.0 if self.total_count else 0.0
+
+    def _adjust_status_count(self, status: BatchItemStatus, delta: int) -> None:
+        if status == BatchItemStatus.PENDING:
+            self.pending_count += delta
+        elif status in {BatchItemStatus.VALIDATING, BatchItemStatus.RUNNING}:
+            self.running_count += delta
+        elif status == BatchItemStatus.SUCCESS:
+            self.success_count += delta
+        elif status == BatchItemStatus.FAILED:
+            self.failed_count += delta
+        elif status == BatchItemStatus.SKIPPED:
+            self.skipped_count += delta
+        elif status == BatchItemStatus.STOPPED:
+            self.stopped_count += delta
+
     @property
     def completed_count(self) -> int:
         return self.success_count + self.failed_count + self.skipped_count + self.stopped_count

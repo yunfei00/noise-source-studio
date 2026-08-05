@@ -3,6 +3,8 @@
 from noise_source_studio.presentation.models.batch_results import (
     BatchResultFilterProxyModel,
     BatchResultTableModel,
+    BatchTaskFilterProxyModel,
+    BatchTaskTableModel,
 )
 from noise_source_studio.presentation.models.validation import (
     ConfusionMatrixTableModel,
@@ -15,6 +17,8 @@ from noise_source_studio.presentation.models.validation import (
 __all__ = [
     "BatchResultFilterProxyModel",
     "BatchResultTableModel",
+    "BatchTaskFilterProxyModel",
+    "BatchTaskTableModel",
     "ConfusionMatrixTableModel",
     "DictTableModel",
     "ManifestPreviewTableModel",

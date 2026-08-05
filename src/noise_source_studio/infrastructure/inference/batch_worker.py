@@ -146,9 +146,8 @@ class BatchWorker(QRunnable):
     def _run_item(self, item: BatchFileItem) -> bool:
         item.started_at = datetime.now(UTC)
         started = perf_counter()
-        item.status = BatchItemStatus.VALIDATING
+        self.task.transition_item_status(item, BatchItemStatus.VALIDATING)
         item.status_message = "校验文件"
-        self.task.refresh_counts()
         self.signals.item_started.emit(item)
         self.signals.item_progress.emit(item, "校验文件")
         LOGGER.info(
@@ -162,9 +161,8 @@ class BatchWorker(QRunnable):
         )
         try:
             self._validate_file(item.file_path)
-            item.status = BatchItemStatus.RUNNING
+            self.task.transition_item_status(item, BatchItemStatus.RUNNING)
             item.status_message = "推理中"
-            self.task.refresh_counts()
             self.signals.item_progress.emit(item, "推理中")
             runtime_result = self.engine.predict_file(item.file_path)
             payload = normalize_prediction_result(runtime_result)
@@ -174,13 +172,12 @@ class BatchWorker(QRunnable):
             item.finished_at = datetime.now(UTC)
             item.elapsed_ms = (perf_counter() - started) * 1000.0
             if self._is_fatal(exc):
-                item.status = BatchItemStatus.FAILED
+                self.task.transition_item_status(item, BatchItemStatus.FAILED)
                 item.status_message = "致命错误"
                 item.error_type = type(exc).__name__
                 item.error_message = str(exc)
                 self.task.status = BatchStatus.FAILED
                 self.task.finished_at = item.finished_at
-                self.task.refresh_counts()
                 self.signals.item_failed.emit(item)
                 self.signals.fatal_error.emit(str(exc))
                 LOGGER.exception(
@@ -190,7 +187,7 @@ class BatchWorker(QRunnable):
                     item.file_path,
                 )
                 return False
-            item.status = BatchItemStatus.FAILED
+            self.task.transition_item_status(item, BatchItemStatus.FAILED)
             item.status_message = "失败"
             item.error_type = type(exc).__name__
             item.error_message = str(exc)
@@ -205,7 +202,7 @@ class BatchWorker(QRunnable):
         else:
             item.finished_at = datetime.now(UTC)
             item.elapsed_ms = (perf_counter() - started) * 1000.0
-            item.status = BatchItemStatus.SUCCESS
+            self.task.transition_item_status(item, BatchItemStatus.SUCCESS)
             item.status_message = "成功"
             self.signals.item_succeeded.emit(item)
             LOGGER.info(
@@ -215,7 +212,6 @@ class BatchWorker(QRunnable):
                 item.file_path,
                 item.elapsed_ms,
             )
-        self.task.refresh_counts()
         self.signals.batch_progress.emit(self.task)
         return True
 

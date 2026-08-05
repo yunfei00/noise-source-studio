@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import sys
+import threading
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
+from typing import Any, TextIO
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
@@ -20,6 +24,7 @@ from noise_source_studio.presentation.main_window import MainWindow
 from noise_source_studio.version import APPLICATION_TITLE, __version__
 
 LOGGER = logging.getLogger("noise_source_studio.application")
+_FAULT_LOG_HANDLE: TextIO | None = None
 
 
 def create_application(arguments: Sequence[str] | None = None) -> QApplication:
@@ -48,8 +53,8 @@ def apply_stylesheet(app: QApplication) -> None:
     app.setStyleSheet(stylesheet_path.read_text(encoding="utf-8"))
 
 
-def install_exception_handler(app: QApplication) -> None:
-    """Log uncaught exceptions and show a concise user-facing error."""
+def install_exception_handler(app: QApplication, log_file: Path | None = None) -> None:
+    """Install process/thread handlers plus an optional native-fault log."""
 
     def handle_exception(
         exception_type: type[BaseException],
@@ -70,8 +75,62 @@ def install_exception_handler(app: QApplication) -> None:
         )
         QMessageBox.critical(None, "Noise Source Studio", message)
 
+    def handle_thread_exception(arguments: Any) -> None:
+        LOGGER.critical(
+            "Unhandled thread exception | thread=%s",
+            getattr(arguments.thread, "name", "unknown"),
+            exc_info=(arguments.exc_type, arguments.exc_value, arguments.exc_traceback),
+        )
+
     sys.excepthook = handle_exception
-    app.aboutToQuit.connect(lambda: LOGGER.info("Application shutdown"))
+    threading.excepthook = handle_thread_exception
+    marker = _enable_fault_diagnostics(log_file) if log_file is not None else None
+
+    def record_normal_shutdown() -> None:
+        global _FAULT_LOG_HANDLE
+        LOGGER.info("Application shutdown | normal=true")
+        if marker is not None:
+            try:
+                marker.write_text(
+                    f"normal {datetime.now(UTC).isoformat()}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                LOGGER.exception("Could not write normal-exit marker | path=%s", marker)
+        if _FAULT_LOG_HANDLE is not None:
+            faulthandler.disable()
+            _FAULT_LOG_HANDLE.close()
+            _FAULT_LOG_HANDLE = None
+
+    app.aboutToQuit.connect(record_normal_shutdown)
+
+
+def _enable_fault_diagnostics(log_file: Path) -> Path:
+    global _FAULT_LOG_HANDLE
+    marker = log_file.with_name("application-exit.status")
+    fault_log = log_file.with_name("noise-source-studio-fault.log")
+    try:
+        if marker.is_file():
+            LOGGER.info(
+                "Previous application exit marker | %s",
+                marker.read_text(encoding="utf-8").strip(),
+            )
+        marker.write_text(
+            f"running {datetime.now(UTC).isoformat()}\n",
+            encoding="utf-8",
+        )
+        if _FAULT_LOG_HANDLE is not None:
+            faulthandler.disable()
+            _FAULT_LOG_HANDLE.close()
+        _FAULT_LOG_HANDLE = fault_log.open("a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_FAULT_LOG_HANDLE, all_threads=True)
+        LOGGER.info("Fault diagnostics enabled | file=%s", fault_log)
+    except (OSError, RuntimeError):
+        LOGGER.exception("Could not enable fault diagnostics | file=%s", fault_log)
+        if _FAULT_LOG_HANDLE is not None:
+            _FAULT_LOG_HANDLE.close()
+            _FAULT_LOG_HANDLE = None
+    return marker
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -89,7 +148,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         QMessageBox.critical(None, "启动失败", f"应用无法完成初始化：{exc}")
         return 1
 
-    install_exception_handler(app)
+    install_exception_handler(app, log_file)
     LOGGER.info("Application startup | version=%s", __version__)
     LOGGER.info("Configuration file | %s", paths.config_file)
     window = MainWindow(settings, settings_manager, log_file)

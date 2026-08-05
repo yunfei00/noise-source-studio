@@ -1055,12 +1055,12 @@ class MainWindow(QMainWindow):
         worker = BatchWorker(self.engine, self.batch_task)
         self.batch_worker = worker
         page = self._batch_prediction_page
-        worker.signals.batch_started.connect(page.refresh_summary)
+        worker.signals.batch_started.connect(page.batch_started)
         worker.signals.item_started.connect(page.refresh_item)
         worker.signals.item_progress.connect(lambda item, _message: page.refresh_item(item))
         worker.signals.item_succeeded.connect(page.refresh_item)
         worker.signals.item_failed.connect(page.refresh_item)
-        worker.signals.batch_progress.connect(page.refresh_summary)
+        worker.signals.batch_progress.connect(page.mark_summary_dirty)
         worker.signals.batch_paused.connect(self._batch_paused)
         worker.signals.batch_resumed.connect(self._batch_resumed)
         worker.signals.batch_stopped.connect(self._batch_terminal)
@@ -1070,7 +1070,7 @@ class MainWindow(QMainWindow):
         self._set_batch_ui_locked(True)
         self._set_application_state("批量推理中")
         self.update_header_status("mode", "批量推理中", "active")
-        page.refresh_table()
+        page.begin_batch_updates()
         self.task_pool.start(worker)
 
     def _pause_batch(self) -> None:
@@ -1086,17 +1086,22 @@ class MainWindow(QMainWindow):
         if self.batch_worker is not None:
             self.batch_worker.request_stop()
             self._batch_prediction_page.show_feedback("正在完成当前文件并安全停止…")
+            self._batch_prediction_page.flush_pending_ui_updates()
             self._batch_prediction_page.refresh_summary()
 
     def _batch_paused(self, task: BatchPredictionTask) -> None:
         self._set_application_state("批量已暂停")
         self.update_header_status("mode", "批量已暂停", "warning")
-        self._batch_prediction_page.refresh_table()
+        self._batch_prediction_page.flush_pending_ui_updates()
+        self._batch_prediction_page.refresh_summary()
+        self._batch_prediction_page.refresh_actions()
 
     def _batch_resumed(self, task: BatchPredictionTask) -> None:
         self._set_application_state("批量推理中")
         self.update_header_status("mode", "批量推理中", "active")
-        self._batch_prediction_page.refresh_table()
+        self._batch_prediction_page.flush_pending_ui_updates()
+        self._batch_prediction_page.refresh_summary()
+        self._batch_prediction_page.refresh_actions()
 
     def _batch_terminal(self, task: BatchPredictionTask) -> None:
         page = self._batch_prediction_page
@@ -1105,8 +1110,8 @@ class MainWindow(QMainWindow):
             if task.status == BatchStatus.STOPPED
             else "全部文件处理完成"
         )
-        page.refresh_table()
-        page.show_results_tab()
+        page.finalize_batch_updates()
+        page.tabs.setCurrentIndex(1)
         self._set_batch_ui_locked(False)
         self._set_application_state("正常")
         self.update_header_status("mode", "本地", "neutral")
@@ -1121,6 +1126,7 @@ class MainWindow(QMainWindow):
         page = self._batch_prediction_page
         page.current_file_label.setText("批量任务因不可恢复错误终止")
         page.show_feedback(f"批量任务已终止：{message}", error=True)
+        page.finalize_batch_updates()
         self._set_batch_ui_locked(False)
         self._set_application_state("推理失败")
         self.update_header_status("mode", "本地", "neutral")
@@ -1133,7 +1139,9 @@ class MainWindow(QMainWindow):
 
     def _batch_worker_finished(self) -> None:
         self.batch_worker = None
-        self._batch_prediction_page.refresh_table()
+        self._batch_prediction_page.flush_pending_ui_updates()
+        self._batch_prediction_page.refresh_summary()
+        self._batch_prediction_page.refresh_actions()
 
     def _retry_batch(self, item_ids: list[str] | None) -> None:
         count = self.batch_prediction_service.retry_failed(self.batch_task, item_ids)
@@ -1204,7 +1212,7 @@ class MainWindow(QMainWindow):
             if locked
             else "",
         )
-        self._batch_prediction_page.refresh_table()
+        self._batch_prediction_page.refresh_actions()
 
     def _check_validation_manifest(
         self,

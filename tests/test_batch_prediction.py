@@ -6,7 +6,7 @@ import csv
 import json
 from pathlib import Path
 from threading import Event, Thread
-from time import sleep
+from time import perf_counter, sleep
 from types import SimpleNamespace
 from typing import Any
 
@@ -228,6 +228,21 @@ def test_single_item_failure_continues(tmp_path: Path) -> None:
     assert task.status == BatchStatus.COMPLETED_WITH_ERRORS
 
 
+@pytest.mark.parametrize("count", [100, 1_000])
+def test_large_fake_batch_preserves_every_prediction(tmp_path: Path, count: int) -> None:
+    task = _task(tmp_path, count)
+    engine = FakeEngine()
+    started = perf_counter()
+    BatchWorker(engine, task).run()  # type: ignore[arg-type]
+    elapsed = perf_counter() - started
+    assert len(engine.calls) == count
+    assert task.success_count == count
+    assert task.failed_count == 0
+    assert all(item.predicted_combination == "101" for item in task.items)
+    assert all(item.predicted_sources == ["风扇", "开关电源"] for item in task.items)
+    assert elapsed < 10.0
+
+
 def test_deleted_file_is_item_error(tmp_path: Path) -> None:
     task = _task(tmp_path)
     task.items[1].file_path.unlink()
@@ -417,7 +432,7 @@ def test_page_table_matches_task_count(qapp: QApplication, qtbot: QtBot, tmp_pat
     page = BatchPredictionPage()
     qtbot.addWidget(page)
     page.set_task(_task(tmp_path, 4))
-    assert page.task_table.rowCount() == 4
+    assert page.task_table.model().rowCount() == 4
 
 
 def test_page_button_states_follow_lifecycle(

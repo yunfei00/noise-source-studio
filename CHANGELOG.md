@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Batch UI performance
+
+- 文件任务表改为 `QTableView`、`QAbstractTableModel` 与筛选代理，使用 item id 索引增量更新。
+- 增加 150 ms item 更新合并、350 ms 摘要刷新和统计页 2 秒可见节流。
+- 运行期间不再逐文件重建表格、重扫筛选选项、全量统计或自适应列宽。
+- 批量 worker 使用缓存计数增量记录单文件状态转换，终态执行一次全量校准。
+- 增加 100 / 1000 / 10000 行性能测试、独立基准脚本和 UI 刷新计数器。
+- 增加主线程、后台线程、原生故障日志与正常退出标志；偶发退出仍列为待复现问题。
+
 ### Compute device
 
 - 增加 `device_preference` 与 `allow_cpu_fallback` 用户配置及旧字段迁移。

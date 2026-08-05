@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -56,16 +57,16 @@ from noise_source_studio.domain.models import SignalPreview
 from noise_source_studio.presentation.models import (
     BatchResultFilterProxyModel,
     BatchResultTableModel,
+    BatchTaskFilterProxyModel,
+    BatchTaskTableModel,
 )
 from noise_source_studio.presentation.widgets import (
     PAGE_CONTENT_MARGINS,
     PAGE_CONTENT_SPACING,
     PageHeader,
     SectionCard,
-    create_table,
 )
 from noise_source_studio.services.batch_prediction_service import BatchPredictionService
-from noise_source_studio.services.result_adapter import primary_probability_summary
 
 STATUS_TEXT = {
     BatchItemStatus.PENDING: "等待",
@@ -109,6 +110,25 @@ class BatchPredictionPage(QWidget):
         self.model_available = False
         self.last_comparison_dialog: QDialog | None = None
         self._selected_result_item: BatchFileItem | None = None
+        self.dirty_item_ids: set[str] = set()
+        self._task_row_by_item_id: dict[str, int] = {}
+        self._task_item_by_id: dict[str, BatchFileItem] = {}
+        self._known_combinations: set[str] = set()
+        self._known_sources: set[str] = set()
+        self._timed_item_ids: set[str] = set()
+        self._elapsed_item_total_ms = 0.0
+        self._summary_dirty = False
+        self._statistics_dirty = False
+        self._result_view_dirty = False
+        self._last_chart_refresh = 0.0
+        self._last_result_view_refresh = 0.0
+        self._task_sort_column: int | None = None
+        self._result_sort_column: int | None = None
+        self.full_table_rebuild_count = 0
+        self.item_row_update_count = 0
+        self.chart_refresh_count = 0
+        self.summary_refresh_count = 0
+        self.main_thread_longest_refresh_ms = 0.0
         self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
@@ -126,11 +146,17 @@ class BatchPredictionPage(QWidget):
         self.tabs.addTab(self._build_file_tasks_tab(), "文件任务")
         self.tabs.addTab(self._build_results_tab(), "预测结果")
         self.tabs.addTab(self._build_statistics_tab(), "统计分析")
+        self.tabs.currentChanged.connect(self._tab_changed)
         layout.addWidget(self.tabs, 1)
 
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.timeout.connect(self.refresh_summary)
-        self._elapsed_timer.start(500)
+        self._item_update_timer = QTimer(self)
+        self._item_update_timer.setSingleShot(True)
+        self._item_update_timer.setInterval(150)
+        self._item_update_timer.timeout.connect(self.flush_pending_ui_updates)
+        self._ui_refresh_timer = QTimer(self)
+        self._ui_refresh_timer.setInterval(350)
+        self._ui_refresh_timer.timeout.connect(self._refresh_dirty_ui)
+        self._ui_refresh_timer.start()
         self._update_actions()
 
     def _build_controls(self) -> SectionCard:
@@ -263,26 +289,29 @@ class BatchPredictionPage(QWidget):
         splitter = QSplitter()
         splitter.setChildrenCollapsible(False)
         table_card = SectionCard("任务明细")
-        self.task_table = create_table(
-            (
-                "序号",
-                "文件名",
-                "目录",
-                "状态",
-                "预测组合",
-                "结果",
-                "主要概率",
-                "耗时",
-                "错误信息",
-            ),
-            minimum_height=310,
-        )
+        self.task_model = BatchTaskTableModel()
+        self.task_proxy = BatchTaskFilterProxyModel()
+        self.task_proxy.setSourceModel(self.task_model)
+        self.task_table = QTableView()
         self.task_table.setObjectName("batchTaskTable")
+        self.task_table.setModel(self.task_proxy)
+        self.task_table.setMinimumHeight(310)
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.task_table.setSortingEnabled(True)
+        self.task_table.setAlternatingRowColors(True)
+        self.task_table.verticalHeader().setVisible(False)
+        self.task_table.setSortingEnabled(False)
+        self.task_table.horizontalHeader().setSortIndicatorShown(True)
         self.task_table.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
-        self.task_table.itemSelectionChanged.connect(self._show_task_detail)
+        self.task_table.horizontalHeader().sectionClicked.connect(self._sort_task_table)
+        self.task_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        task_widths = (55, 150, 250, 90, 110, 160, 110, 95, 260)
+        for column, width in enumerate(task_widths):
+            self.task_table.setColumnWidth(column, width)
+        self.task_table.horizontalHeader().setStretchLastSection(True)
+        self.task_table.selectionModel().selectionChanged.connect(self._show_task_detail)
         table_card.content_layout.addWidget(self.task_table)
         splitter.addWidget(table_card)
 
@@ -377,8 +406,10 @@ class BatchPredictionPage(QWidget):
         self.result_table = QTableView()
         self.result_table.setObjectName("batchResultTable")
         self.result_table.setModel(self.result_proxy)
-        self.result_table.setSortingEnabled(True)
-        self.result_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.result_table.setSortingEnabled(False)
+        self.result_table.horizontalHeader().setSortIndicatorShown(True)
+        self.result_table.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        self.result_table.horizontalHeader().sectionClicked.connect(self._sort_result_table)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.result_table.setAlternatingRowColors(True)
@@ -505,51 +536,33 @@ class BatchPredictionPage(QWidget):
         return tab
 
     def set_task(self, task: BatchPredictionTask) -> None:
+        self.dirty_item_ids.clear()
+        self._item_update_timer.stop()
         self.task = task
+        task.refresh_counts()
         self.result_model.set_task(task)
+        self._reset_timing_cache()
+        self.rebuild_task_table()
         self._rebuild_result_filter_options()
-        self.refresh_table()
+        self._apply_result_filters()
+        self.refresh_summary()
         self.refresh_statistics()
+        self._update_actions()
+        self._show_task_detail()
 
     def set_model_available(self, available: bool) -> None:
         self.model_available = available
         self._update_actions()
 
     def refresh_table(self, *_: Any) -> None:
+        """Fully reconcile all views after an intentional bulk task change."""
         task = self.task
-        selected = set(self._selected_ids())
-        self.task_table.setSortingEnabled(False)
-        self.task_table.setRowCount(0 if task is None else len(task.items))
+        self.dirty_item_ids.clear()
+        self._item_update_timer.stop()
         if task is not None:
-            for row, item in enumerate(task.items):
-                values = (
-                    item.sequence,
-                    item.file_name,
-                    str(item.file_path.parent),
-                    STATUS_TEXT[item.status],
-                    item.predicted_combination or "—",
-                    ", ".join(item.predicted_sources) or "—",
-                    primary_probability_summary(item.result or {}),
-                    f"{item.elapsed_ms:.1f} ms" if item.elapsed_ms is not None else "—",
-                    item.error_message or "—",
-                )
-                for column, value in enumerate(values):
-                    cell = QTableWidgetItem(str(value))
-                    if column == 0:
-                        cell.setData(Qt.ItemDataRole.DisplayRole, item.sequence)
-                    cell.setData(Qt.ItemDataRole.UserRole, item.item_id)
-                    cell.setToolTip(str(value))
-                    if column == 3:
-                        cell.setIcon(self._status_icon(item.status))
-                    if column in {0, 3, 7}:
-                        cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    self.task_table.setItem(row, column, cell)
-                if item.item_id in selected:
-                    self.task_table.selectRow(row)
-        self.task_table.setSortingEnabled(True)
-        self.task_table.resizeColumnsToContents()
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        self._apply_task_filter()
+            task.refresh_counts()
+        self._reset_timing_cache()
+        self.rebuild_task_table()
         self.result_model.refresh()
         self._rebuild_result_filter_options()
         self._apply_result_filters()
@@ -558,19 +571,243 @@ class BatchPredictionPage(QWidget):
         self._update_actions()
         self._show_task_detail()
 
+    def rebuild_task_table(self) -> None:
+        """Rebuild the task table only for bulk queue changes or final calibration."""
+        started = perf_counter()
+        task = self.task
+        selected = set(self._selected_ids())
+        self.task_model.set_task(task)
+        self._reindex_task_rows()
+        self._apply_task_filter()
+        selection = self.task_table.selectionModel()
+        for item_id in selected:
+            source_row = self._locate_task_row(item_id)
+            if source_row is None:
+                continue
+            proxy_index = self.task_proxy.mapFromSource(self.task_model.index(source_row, 0))
+            if proxy_index.isValid():
+                selection.select(
+                    proxy_index,
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+        self.full_table_rebuild_count += 1
+        self._record_ui_refresh(started)
+
+    def insert_item_row(self, item: BatchFileItem) -> None:
+        """Insert one task row while keeping the item-to-row index valid."""
+        self.task_model.insert_item(item)
+        self._reindex_task_rows()
+
+    def update_item_row(self, item: BatchFileItem) -> None:
+        """Update only the mutable cells for one item."""
+        self._update_item_rows([item])
+
+    def remove_item_row(self, item_id: str) -> None:
+        """Remove one indexed row without rebuilding unaffected rows."""
+        self.task_model.remove_item(item_id)
+        self._reindex_task_rows()
+
     def refresh_item(self, item: BatchFileItem) -> None:
         if item.status in {BatchItemStatus.VALIDATING, BatchItemStatus.RUNNING}:
             self.current_file_label.setText(f"当前：{item.file_name}")
-        self.refresh_table()
+        self.dirty_item_ids.add(item.item_id)
+        self._summary_dirty = True
+        self._statistics_dirty = True
+        self._result_view_dirty = True
+        if not self._item_update_timer.isActive():
+            self._item_update_timer.start()
 
-    def refresh_summary(self, *_: Any) -> None:
+    def flush_pending_ui_updates(self) -> None:
+        """Apply coalesced worker notifications on the Qt main thread."""
+        self._item_update_timer.stop()
+        if not self.dirty_item_ids:
+            return
+        item_ids = set(self.dirty_item_ids)
+        self.dirty_item_ids.clear()
+        items = [
+            item
+            for item_id in item_ids
+            if (item := self._task_item_by_id.get(item_id)) is not None
+        ]
+        self._update_item_rows(items)
+
+    def mark_summary_dirty(self, *_: Any) -> None:
+        """Defer worker progress signals to the periodic UI refresh."""
+        self._summary_dirty = True
+
+    def batch_started(self, *_: Any) -> None:
+        """Refresh lifecycle controls once after the worker enters running state."""
+        self._summary_dirty = True
+        self._update_actions()
+
+    def begin_batch_updates(self) -> None:
+        """Reset run-scoped counters without rebuilding the task table."""
+        self.reset_performance_counters()
+        self._reset_timing_cache()
+        self._summary_dirty = True
+        self._statistics_dirty = True
+        self._result_view_dirty = True
+        self.refresh_summary()
+        self._update_actions()
+
+    def finalize_batch_updates(self) -> None:
+        """Flush and fully calibrate views once when a batch terminates."""
+        self.flush_pending_ui_updates()
+        if self.task is not None:
+            self.task.refresh_counts()
+        self._reset_timing_cache()
+        self.rebuild_task_table()
+        self.result_model.refresh()
+        self._rebuild_result_filter_options()
+        self._apply_result_filters()
+        self.refresh_summary()
+        self.refresh_statistics()
+        self._summary_dirty = False
+        self._statistics_dirty = False
+        self._result_view_dirty = False
+        self._update_actions()
+
+    def refresh_actions(self) -> None:
+        """Update controls without touching task or result data."""
+        self._update_actions()
+
+    def reset_performance_counters(self) -> None:
+        self.full_table_rebuild_count = 0
+        self.item_row_update_count = 0
+        self.chart_refresh_count = 0
+        self.summary_refresh_count = 0
+        self.main_thread_longest_refresh_ms = 0.0
+
+    def performance_counters(self) -> dict[str, int | float]:
+        return {
+            "full_table_rebuild_count": self.full_table_rebuild_count,
+            "item_row_update_count": self.item_row_update_count,
+            "chart_refresh_count": self.chart_refresh_count,
+            "summary_refresh_count": self.summary_refresh_count,
+            "main_thread_longest_refresh_ms": self.main_thread_longest_refresh_ms,
+        }
+
+    def _update_item_rows(self, items: list[BatchFileItem]) -> None:
+        if not items:
+            return
+        started = perf_counter()
+        updated_ids: set[str] = set()
+        for item in items:
+            if self._locate_task_row(item.item_id) is None:
+                self.task_model.insert_item(item)
+            self._task_item_by_id[item.item_id] = item
+            self._collect_result_filter_options(item)
+            self._record_item_timing(item)
+            self.item_row_update_count += 1
+            updated_ids.add(item.item_id)
+
+        self.task_model.notify_items_changed(updated_ids)
+        self.result_model.notify_items_changed(updated_ids)
+        self._record_ui_refresh(started)
+
+    def _reindex_task_rows(self) -> None:
+        self._task_row_by_item_id = dict(self.task_model.row_by_item_id)
+        self._task_item_by_id = {item.item_id: item for item in self.task_model.items}
+
+    def _locate_task_row(self, item_id: str) -> int | None:
+        return self.task_model.row_by_item_id.get(item_id)
+
+    def _reset_timing_cache(self) -> None:
+        task = self.task
+        timed = [
+            item
+            for item in (task.items if task is not None else [])
+            if item.elapsed_ms is not None
+            and item.status in {BatchItemStatus.SUCCESS, BatchItemStatus.FAILED}
+        ]
+        self._timed_item_ids = {item.item_id for item in timed}
+        self._elapsed_item_total_ms = sum(float(item.elapsed_ms or 0.0) for item in timed)
+
+    def _record_item_timing(self, item: BatchFileItem) -> None:
+        if (
+            item.item_id not in self._timed_item_ids
+            and item.elapsed_ms is not None
+            and item.status in {BatchItemStatus.SUCCESS, BatchItemStatus.FAILED}
+        ):
+            self._timed_item_ids.add(item.item_id)
+            self._elapsed_item_total_ms += item.elapsed_ms
+
+    def _record_ui_refresh(self, started: float) -> None:
+        elapsed_ms = (perf_counter() - started) * 1000.0
+        self.main_thread_longest_refresh_ms = max(
+            self.main_thread_longest_refresh_ms,
+            elapsed_ms,
+        )
+
+    def _refresh_dirty_ui(self) -> None:
         task = self.task
         if task is None:
             return
-        task.refresh_counts()
+        running = task.status in RUNNING_BATCH_STATUSES
+        now = perf_counter()
+        if self._summary_dirty or running:
+            self.refresh_summary()
+        if (
+            self._result_view_dirty
+            and self.tabs.currentIndex() == 1
+            and now - self._last_result_view_refresh >= 1.0
+        ):
+            self._refresh_visible_result_view()
+        if (
+            self._statistics_dirty
+            and self.tabs.currentIndex() == 2
+            and (not running or now - self._last_chart_refresh >= 2.0)
+        ):
+            self.refresh_statistics()
+
+    def _tab_changed(self, index: int) -> None:
+        if index == 1:
+            self._refresh_visible_result_view()
+        elif index == 2:
+            self.refresh_statistics()
+
+    def _refresh_visible_result_view(self) -> None:
+        self._update_filtered_count()
+        self._result_view_dirty = False
+        self._last_result_view_refresh = perf_counter()
+
+    def _collect_result_filter_options(self, item: BatchFileItem) -> None:
+        combination = item.predicted_combination
+        if combination and combination not in self._known_combinations:
+            self._known_combinations.add(combination)
+            self.combination_filter.blockSignals(True)
+            self.combination_filter.addItem(combination, combination)
+            self.combination_filter.blockSignals(False)
+        for source in item.predicted_sources:
+            if source in self._known_sources:
+                continue
+            self._known_sources.add(source)
+            option = QListWidgetItem(source)
+            option.setFlags(option.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            option.setCheckState(Qt.CheckState.Unchecked)
+            self.source_filter.blockSignals(True)
+            self.source_filter.addItem(option)
+            self.source_filter.blockSignals(False)
+
+    def refresh_summary(self, *_: Any) -> None:
+        started = perf_counter()
+        task = self.task
+        if task is None:
+            return
         self.progress_bar.setValue(round(task.progress * 10))
         self.progress_bar.setFormat(
             f"{task.completed_count} / {task.total_count}  ({task.progress:.1f}%)"
+        )
+        average = (
+            self._elapsed_item_total_ms / len(self._timed_item_ids) / 1000.0
+            if self._timed_item_ids
+            else None
+        )
+        eta = (
+            max(0.0, average * (task.pending_count + task.running_count))
+            if average is not None and len(self._timed_item_ids) >= 2
+            else None
         )
         values = {
             "total": str(task.total_count),
@@ -581,15 +818,9 @@ class BatchPredictionPage(QWidget):
             "pending": str(task.pending_count),
             "elapsed": self._duration(task.elapsed_seconds),
             "average": (
-                self._duration(task.average_item_seconds)
-                if task.average_item_seconds is not None
-                else "计算中"
+                self._duration(average) if average is not None else "计算中"
             ),
-            "eta": (
-                self._duration(task.estimated_remaining_seconds)
-                if task.estimated_remaining_seconds is not None
-                else "计算中"
-            ),
+            "eta": self._duration(eta) if eta is not None else "计算中",
         }
         titles = {
             "total": "总数",
@@ -616,11 +847,14 @@ class BatchPredictionPage(QWidget):
                 BatchStatus.FAILED: "任务失败",
             }[task.status]
         )
+        self._summary_dirty = False
+        self.summary_refresh_count += 1
+        self._record_ui_refresh(started)
 
     def refresh_statistics(self) -> None:
+        started = perf_counter()
         if self.task is None:
             return
-        self.task.refresh_counts()
         stats = BatchPredictionService.statistics(self.task)
         self.analysis_metrics["total"].setText(f"总文件数\n{stats['total']}")
         self.analysis_metrics["success"].setText(f"成功数\n{stats['success']}")
@@ -637,6 +871,10 @@ class BatchPredictionPage(QWidget):
         self._set_chart("source", stats["sources"])
         self._set_chart("confidence", stats["confidence_buckets"])
         self._set_chart("error", stats["errors"])
+        self._statistics_dirty = False
+        self._last_chart_refresh = perf_counter()
+        self.chart_refresh_count += 1
+        self._record_ui_refresh(started)
 
     def show_results_tab(self) -> None:
         """Switch to results after a completed, stopped or historical batch."""
@@ -746,6 +984,9 @@ class BatchPredictionPage(QWidget):
                 self.result_proxy.error_type if self.error_only_checkbox.isChecked() else ""
             ),
         )
+        self._update_filtered_count()
+
+    def _update_filtered_count(self) -> None:
         count = self.result_proxy.rowCount()
         total = self.result_model.rowCount()
         self.filtered_count_label.setText(f"{count:,} / {total:,} 条结果")
@@ -761,6 +1002,7 @@ class BatchPredictionPage(QWidget):
             if task
             else []
         )
+        self._known_combinations = set(combinations)
         selected_combination = self.combination_filter.currentData()
         self.combination_filter.blockSignals(True)
         self.combination_filter.clear()
@@ -779,6 +1021,7 @@ class BatchPredictionPage(QWidget):
         sources = sorted(
             {source for item in (task.items if task else []) for source in item.predicted_sources}
         )
+        self._known_sources = set(sources)
         self.source_filter.blockSignals(True)
         self.source_filter.clear()
         for source in sources:
@@ -1004,11 +1247,13 @@ class BatchPredictionPage(QWidget):
             self.export_requested.emit(Path(path))
 
     def _selected_ids(self) -> list[str]:
-        return [
-            str(self.task_table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole))
-            for index in self.task_table.selectionModel().selectedRows()
-            if self.task_table.item(index.row(), 0) is not None
-        ]
+        selected: list[str] = []
+        for proxy_index in self.task_table.selectionModel().selectedRows():
+            source_index = self.task_proxy.mapToSource(proxy_index)
+            item = self.task_model.item_at(source_index.row())
+            if item is not None:
+                selected.append(item.item_id)
+        return selected
 
     def _selected_task_item(self) -> BatchFileItem | None:
         if self.task is None:
@@ -1047,20 +1292,34 @@ class BatchPredictionPage(QWidget):
         self._update_actions()
 
     def _apply_task_filter(self, *_: Any) -> None:
-        query = self.search_edit.text().strip().casefold()
-        status = self.status_filter.currentData()
-        if self.task is None:
-            return
-        by_id = {item.item_id: item for item in self.task.items}
-        for row in range(self.task_table.rowCount()):
-            cell = self.task_table.item(row, 0)
-            item = by_id.get(str(cell.data(Qt.ItemDataRole.UserRole))) if cell else None
-            visible = item is not None
-            if item is not None and query:
-                visible = query in f"{item.file_name} {item.file_path}".casefold()
-            if item is not None and status is not None:
-                visible = visible and item.status == status
-            self.task_table.setRowHidden(row, not visible)
+        self.task_proxy.set_filters(
+            self.search_edit.text(),
+            self.status_filter.currentData(),
+        )
+
+    def _sort_task_table(self, column: int) -> None:
+        order = (
+            Qt.SortOrder.DescendingOrder
+            if self._task_sort_column == column
+            and self.task_table.horizontalHeader().sortIndicatorOrder()
+            == Qt.SortOrder.AscendingOrder
+            else Qt.SortOrder.AscendingOrder
+        )
+        self._task_sort_column = column
+        self.task_table.horizontalHeader().setSortIndicator(column, order)
+        self.task_proxy.sort(column, order)
+
+    def _sort_result_table(self, column: int) -> None:
+        order = (
+            Qt.SortOrder.DescendingOrder
+            if self._result_sort_column == column
+            and self.result_table.horizontalHeader().sortIndicatorOrder()
+            == Qt.SortOrder.AscendingOrder
+            else Qt.SortOrder.AscendingOrder
+        )
+        self._result_sort_column = column
+        self.result_table.horizontalHeader().setSortIndicator(column, order)
+        self.result_proxy.sort(column, order)
 
     def _remove_selected(self) -> None:
         if selected := self._selected_ids():
