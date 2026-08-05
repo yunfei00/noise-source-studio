@@ -1,5 +1,12 @@
 # Noise Source Studio
 
+## Phase 5A：任务历史与结果管理
+
+任务历史页面使用用户应用数据目录中的 SQLite 索引统一管理单文件预测、批量预测和模型验证。
+完整预测 JSON、批量 CSV 和验证报告仍保存在输出目录，历史索引不会保存原始信号、Tensor 或完整
+批量样本结果。历史任务支持数据库分页、多条件筛选、备注与标签、文件校验、原页面恢复、目录扫描、
+安全删除、备份和原子重建；打开历史结果不会重新执行模型推理。
+
 ## Phase 4：模型验证中心
 
 模型验证页面已经提供完整的 manifest 驱动验证流程，并继续复用当前激活模型的单一
@@ -17,7 +24,7 @@
 [验证数据契约](docs/validation_manifest.md)。
 
 Noise Source Studio（噪声源智能识别平台）是一款面向噪声源多标签识别的 Windows
-桌面应用。当前 Phase 3 已在冻结的商业 GUI 框架上完成模型包管理、单文件推理和专业批量预测。
+桌面应用。当前 Phase 5A 已在冻结的商业 GUI 框架上完成模型管理、推理、验证和统一任务历史。
 
 训练仓库中的 CSV 解析、STFT、模型结构与 PyTorch 细节不会复制到本仓库。GUI 只通过独立交付的
 `noise_source_runtime` wheel 使用这些能力，并长期复用一个 `InferenceSession`。
@@ -64,7 +71,8 @@ python -m noise_source_studio
 noise-source-studio
 ```
 
-配置、日志、模型注册表和输出默认保存在当前 Windows 用户的应用数据目录，不写入源码目录。
+配置、日志、模型注册表、历史数据库和输出默认保存在当前 Windows 用户的应用数据目录，
+不写入源码目录。
 
 ## 模型包导入
 
@@ -91,7 +99,8 @@ sha256.txt
 - structured 主显示使用 `label_marginal_probabilities`，最终结论使用 runtime 返回的
   `decoded_label_vector`、`predicted_combination` 和 `predicted_sources`。
 - multilabel 主显示使用 `multilabel_probabilities`，最终标签由 runtime 的实际 thresholds 判定。
-- 用户显式点击导出后才写 prediction JSON；inference contract 为可选项。
+- 预测成功后自动写入轻量历史目录中的 `task.json` 和 `prediction.json`；用户显式导出时仍可
+  另存结果，inference contract 为可选项。
 
 ## 批量预测
 
@@ -158,6 +167,12 @@ python -m pytest
 python scripts\benchmark_batch_ui.py 100 1000 10000
 ```
 
+任务历史 100 / 1000 / 10000 条数据库分页与筛选性能基准：
+
+```powershell
+python scripts\benchmark_history.py 100 1000 10000
+```
+
 真实黄金样本测试：
 
 ```powershell
@@ -187,11 +202,12 @@ python -m pytest tests\integration\test_batch_consistency.py
 - 单文件严格 CSV 解析、信号预览、后台推理、动态结果展示和显式导出
 - 批量队列、顺序推理、暂停/继续/停止、错误隔离、失败重试和四文件导出
 - 批量结果检索、动态详情、按需波形、统计联动、历史恢复和多结果对比
+- SQLite 统一任务历史、数据库分页筛选、备注标签、文件校验、三类结果恢复、扫描重建和备份
 - fake runtime 自动化测试和环境变量驱动的真实模型集成测试
 
 ## 尚未实现
 
-- SQLite 任务历史与未完成任务自动恢复
+- 多模型性能横向对比、训练、阈值优化和云端同步
 - 多线程模型 forward、多 GPU 和远程推理
 - 用户权限、自动更新和安装包
 
@@ -205,9 +221,10 @@ noise-source-studio/
 │   ├── domain/                    # 稳定领域模型、批量状态与接口
 │   ├── infrastructure/
 │   │   ├── config/                # JSON 配置
+│   │   ├── history/               # SQLite schema、迁移和 repository
 │   │   ├── inference/             # runtime 适配层与批量 worker
 │   │   └── logging/               # 轮转日志
-│   ├── services/                  # 模型、单文件/批量预测与导出编排
+│   ├── services/                  # 模型、预测、验证、历史索引与导出编排
 │   └── presentation/              # 主窗口、页面、组件、图标和样式
 ├── tests/
 │   └── integration/               # 可选真实模型测试

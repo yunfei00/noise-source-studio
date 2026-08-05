@@ -31,10 +31,12 @@ class PredictionService:
         self,
         source_path: Path,
         model: ModelRecord,
+        *,
+        task_id: str | None = None,
     ) -> PredictionOutcome:
         """Run one prediction and attach stable task diagnostics."""
         source = Path(source_path)
-        task_id = uuid4().hex
+        task_id = task_id or uuid4().hex
         started_at = datetime.now(UTC)
         started_counter = perf_counter()
         try:

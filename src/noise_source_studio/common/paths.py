@@ -46,6 +46,16 @@ class ApplicationPaths:
         """Return the main application log file."""
         return self.log_directory / "noise-source-studio.log"
 
+    @property
+    def history_directory(self) -> Path:
+        """Return the user-local directory containing the history index and backups."""
+        return self.data_directory / "history"
+
+    @property
+    def history_database(self) -> Path:
+        """Return the SQLite history-index location."""
+        return self.history_directory / "history.db"
+
     def ensure_directories(self) -> None:
         """Create writable application directories when they do not yet exist."""
         for directory in (
@@ -54,5 +64,6 @@ class ApplicationPaths:
             self.log_directory,
             self.model_directory,
             self.output_directory,
+            self.history_directory,
         ):
             directory.mkdir(parents=True, exist_ok=True)

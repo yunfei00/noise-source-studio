@@ -363,6 +363,26 @@ class SinglePredictionPage(QWidget):
         self.engine_message.hide()
         self._update_predict_enabled()
 
+    def show_history(self, outcome: PredictionOutcome) -> None:
+        """Restore a saved result without parsing the source or running inference."""
+        self.selected_file = outcome.source_path
+        self.file_name_label.setText(outcome.source_path.name)
+        self.file_path_label.setText(str(outcome.source_path))
+        try:
+            stat = outcome.source_path.stat()
+        except OSError:
+            self.file_size_label.setText("源文件当前不可用")
+            self.file_modified_label.setText("—")
+        else:
+            self.file_size_label.setText(self._format_file_size(stat.st_size))
+            self.file_modified_label.setText(
+                datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            )
+        self._preview_valid = False
+        self._clear_preview()
+        self.show_prediction(outcome)
+        self._show_message("已从历史记录恢复结果，未重新执行模型推理。", error=False)
+
     def show_prediction_error(self, message: str) -> None:
         """Restore all controls after an inference exception."""
         self.predict_button.setText("开始预测")

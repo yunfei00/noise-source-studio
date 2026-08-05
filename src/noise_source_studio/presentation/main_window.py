@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
+from uuid import uuid4
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QMouseEvent
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -34,6 +36,7 @@ from noise_source_studio.domain.batch import (
     BatchStatus,
 )
 from noise_source_studio.domain.device import DeviceProbeReport, DeviceResolution
+from noise_source_studio.domain.history import HistoryQuery, TaskType
 from noise_source_studio.domain.interfaces import InferenceEngine
 from noise_source_studio.domain.models import LoadedModel, ModelRecord, PredictionOutcome
 from noise_source_studio.domain.validation import (
@@ -60,6 +63,7 @@ from noise_source_studio.presentation.pages import (
 from noise_source_studio.services import (
     BatchPredictionService,
     DeviceService,
+    HistoryService,
     ModelService,
     PredictionService,
     ValidationService,
@@ -119,6 +123,8 @@ class HeaderStatusUnit(QFrame):
 class MainWindow(QMainWindow):
     """Commercial-style shell hosting all application workflows."""
 
+    history_scan_progress = Signal(int, int, str)
+
     def __init__(
         self,
         settings: AppSettings,
@@ -130,10 +136,12 @@ class MainWindow(QMainWindow):
         batch_prediction_service: BatchPredictionService | None = None,
         validation_service: ValidationService | None = None,
         device_service: DeviceService | None = None,
+        history_service: HistoryService | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self.settings_manager = settings_manager
         self.header_statuses: dict[str, HeaderStatusUnit] = {}
         self.engine = engine or RuntimeAdapter()
         self.device_service = device_service or DeviceService(self.engine)
@@ -151,6 +159,19 @@ class MainWindow(QMainWindow):
         self.validation_service = validation_service or ValidationService(
             settings.output_directory,
         )
+        self.history_service: HistoryService | None = history_service
+        self.history_error = ""
+        if self.history_service is None:
+            try:
+                self.history_service = HistoryService(
+                    settings_manager.paths.history_database,
+                    settings.output_directory,
+                    model_root=settings.model_directory,
+                )
+            except Exception as exc:
+                self.history_error = str(exc)
+                LOGGER.exception("History index unavailable")
+        self._history_scan_cancel: Event | None = None
         self.batch_task = self.batch_prediction_service.create_task()
         self.batch_worker: BatchWorker | None = None
         self.validation_task: ValidationTask | None = None
@@ -203,6 +224,10 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._refresh_model_views()
         self.set_current_page(0)
+        if self.history_service is not None:
+            QTimer.singleShot(0, self._history_page.request_query)
+        else:
+            self._history_page.set_unavailable(self.history_error or "未知错误")
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.shutdown)
@@ -394,6 +419,23 @@ class MainWindow(QMainWindow):
         validation_page.waveform_requested.connect(self._preview_validation_sample)
         validation_page.export_requested.connect(self._export_validation_copy)
 
+        history_page = self._history_page
+        history_page.query_requested.connect(self._query_history)
+        history_page.open_task_requested.connect(self._open_history_task)
+        history_page.open_directory_requested.connect(self._open_history_directory)
+        history_page.verify_requested.connect(self._verify_history_task)
+        history_page.notes_requested.connect(self._update_history_notes)
+        history_page.delete_requested.connect(self._delete_history_task)
+        history_page.export_requested.connect(self._export_history_summary)
+        history_page.scan_requested.connect(self._scan_history_outputs)
+        history_page.scan_cancel_requested.connect(self._cancel_history_scan)
+        history_page.rebuild_requested.connect(self._rebuild_history_index)
+        history_page.backup_requested.connect(self._backup_history_database)
+        history_page.database_directory_requested.connect(
+            self._open_history_database_directory
+        )
+        self.history_scan_progress.connect(history_page.show_scan_progress)
+
         settings_page = self._settings_page
         settings_page.settings_save_requested.connect(self._save_settings)
         settings_page.device_probe_requested.connect(self._probe_devices)
@@ -433,10 +475,263 @@ class MainWindow(QMainWindow):
         return page
 
     @property
+    def _history_page(self) -> HistoryPage:
+        page = self.pages[5]
+        assert isinstance(page, HistoryPage)
+        return page
+
+    @property
     def _settings_page(self) -> SettingsPage:
         page = self.pages[7]
         assert isinstance(page, SettingsPage)
         return page
+
+    def _query_history(self, query: HistoryQuery) -> None:
+        service = self.history_service
+        if service is None:
+            self._history_page.set_unavailable(self.history_error or "历史服务未初始化")
+            return
+        self._run_task(
+            lambda: (service.list_tasks(query), service.overview()),
+            "历史任务查询",
+            lambda payload: self._history_page.show_results(payload[0], payload[1]),
+            self._history_page.show_error,
+        )
+
+    def _open_history_task(self, task_id: str) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        page = self._history_page
+        page.loading_label.setText("正在读取任务结果，不会重新执行模型推理…")
+
+        def load() -> tuple[TaskType, object]:
+            record = service.get_task(task_id)
+            if record is None:
+                raise ValueError("历史任务不存在或已被删除。")
+            if record.integrity_status.value in {"missing", "corrupt"}:
+                service.verify_task(task_id)
+            if record.task_type == TaskType.SINGLE:
+                payload: object = service.load_single_prediction(task_id)
+            elif record.task_type == TaskType.BATCH:
+                payload = self.batch_prediction_service.load_history(
+                    Path(record.result_directory)
+                )
+            else:
+                payload = self.validation_service.load_history(Path(record.result_directory))
+            service.mark_opened(task_id)
+            return record.task_type, payload
+
+        def loaded(payload: tuple[TaskType, object]) -> None:
+            task_type, result = payload
+            if task_type == TaskType.SINGLE:
+                assert isinstance(result, PredictionOutcome)
+                self._single_prediction_page.show_history(result)
+                self.navigation.select_page(1)
+            elif task_type == TaskType.BATCH:
+                assert isinstance(result, BatchPredictionTask)
+                self.batch_task = result
+                self._batch_prediction_page.show_history(result)
+                self.navigation.select_page(2)
+            else:
+                assert isinstance(result, ValidationTask)
+                self.validation_task = result
+                self._validation_page.show_history(result)
+                self.navigation.select_page(3)
+
+        self._run_task(load, "打开历史任务", loaded, page.show_error)
+
+    def _open_history_directory(self, task_id: str) -> None:
+        service = self.history_service
+        if service is None:
+            return
+
+        def opened(record: object) -> None:
+            if record is None or not getattr(record, "result_directory", ""):
+                self._history_page.show_error("该任务没有可打开的结果目录。")
+                return
+            path = Path(record.result_directory)
+            if not path.is_dir():
+                self._history_page.show_error("结果目录不存在，请先执行完整性校验。")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+        self._run_task(
+            lambda: service.get_task(task_id),
+            "读取历史任务目录",
+            opened,
+            self._history_page.show_error,
+        )
+
+    def _verify_history_task(self, task_id: str) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        self._run_task(
+            lambda: service.verify_task(task_id),
+            "历史文件完整性校验",
+            lambda status: self._history_page.show_operation_result(
+                f"文件校验完成：{status.value}"
+            ),
+            self._history_page.show_error,
+        )
+
+    def _update_history_notes(
+        self,
+        task_id: str,
+        notes: str,
+        tags: object,
+    ) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        normalized_tags = tuple(str(value) for value in tags)
+        self._run_task(
+            lambda: service.update_notes(task_id, notes, normalized_tags),
+            "保存历史备注",
+            lambda _changed: self._history_page.show_operation_result("备注与标签已保存"),
+            self._history_page.show_error,
+        )
+
+    def _delete_history_task(self, task_id: str, with_files: bool) -> None:
+        service = self.history_service
+        if service is None:
+            return
+
+        def confirm(record: object) -> None:
+            if record is None:
+                self._history_page.show_error("历史任务不存在或已被删除。")
+                return
+            result_directory = getattr(record, "result_directory", "")
+            detail = (
+                f"\n\n将同时永久删除：\n{result_directory}"
+                if with_files
+                else "\n\n结果文件将保留，可通过扫描重新建立索引。"
+            )
+            answer = QMessageBox.warning(
+                self,
+                "确认删除历史任务",
+                f"确定删除任务 {task_id} 的索引吗？{detail}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            operation = (
+                (lambda: service.delete_task_files(task_id))
+                if with_files
+                else (lambda: service.delete_index(task_id))
+            )
+            self._run_task(
+                operation,
+                "删除历史任务",
+                lambda _deleted: self._history_page.show_operation_result("历史任务已删除"),
+                self._history_page.show_error,
+            )
+
+        self._run_task(
+            lambda: service.get_task(task_id),
+            "读取待删除任务",
+            confirm,
+            self._history_page.show_error,
+        )
+
+    def _export_history_summary(self, query: HistoryQuery, destination: Path) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        self._run_task(
+            lambda: service.export_summary(query, destination),
+            "导出历史任务摘要",
+            lambda path: self._history_page.show_operation_result(
+                f"筛选摘要已导出：{path}", refresh=False
+            ),
+            self._history_page.show_error,
+        )
+
+    def _scan_history_outputs(self) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        self._history_scan_cancel = Event()
+        cancel_event = self._history_scan_cancel
+        self._history_page.loading_label.setText("正在后台扫描已有结果目录…")
+
+        def scanned(report: object) -> None:
+            self._history_scan_cancel = None
+            message = (
+                f"扫描完成：新增 {report.imported_tasks}，更新 {report.updated_tasks}，"
+                f"损坏 {len(report.corrupted_directories)}"
+            )
+            self._history_page.show_operation_result(message)
+
+        self._run_task(
+            lambda: service.scan_outputs(
+                cancel_event=cancel_event,
+                progress=lambda current, total, path: self.history_scan_progress.emit(
+                    current, total, path
+                ),
+            ),
+            "扫描历史结果",
+            scanned,
+            self._history_page.show_error,
+            lambda: setattr(self, "_history_scan_cancel", None),
+        )
+
+    def _cancel_history_scan(self) -> None:
+        if self._history_scan_cancel is not None:
+            self._history_scan_cancel.set()
+            self._history_page.loading_label.setText("正在取消扫描…")
+
+    def _rebuild_history_index(self) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "重建历史索引",
+            "将先备份当前数据库，再从结果目录构建临时索引并原子替换。继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._history_scan_cancel = Event()
+        cancel_event = self._history_scan_cancel
+        self._run_task(
+            lambda: service.rebuild_index(
+                cancel_event=cancel_event,
+                progress=lambda current, total, path: self.history_scan_progress.emit(
+                    current, total, path
+                ),
+            ),
+            "重建历史索引",
+            lambda payload: self._history_page.show_operation_result(
+                f"索引重建完成，原数据库备份至：{payload[0]}"
+            ),
+            self._history_page.show_error,
+            lambda: setattr(self, "_history_scan_cancel", None),
+        )
+
+    def _backup_history_database(self) -> None:
+        service = self.history_service
+        if service is None:
+            return
+        self._run_task(
+            service.backup_database,
+            "备份历史数据库",
+            lambda path: self._history_page.show_operation_result(
+                f"数据库备份完成：{path}", refresh=False
+            ),
+            self._history_page.show_error,
+        )
+
+    def _open_history_database_directory(self) -> None:
+        service = self.history_service
+        if service is not None:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(service.database_path.parent.resolve()))
+            )
 
     def _run_task(
         self,
@@ -873,6 +1168,7 @@ class MainWindow(QMainWindow):
             self._single_prediction_page.show_prediction_error("当前没有已加载的活动模型。")
             return
         locked_record = record
+        task_id = uuid4().hex
         page = self._single_prediction_page
         self._single_prediction_running = True
         self._settings_page.set_device_switch_locked(
@@ -894,11 +1190,34 @@ class MainWindow(QMainWindow):
             self._single_prediction_running = False
             self._settings_page.set_device_switch_locked(False)
 
+        def predict_and_record() -> PredictionOutcome:
+            service = self.history_service
+            if service is not None:
+                self._record_history_safely(
+                    lambda: service.register_single_running(
+                        task_id,
+                        source_path,
+                        locked_record,
+                    )
+                )
+            try:
+                outcome = self.prediction_service.predict_file(
+                    source_path,
+                    locked_record,
+                    task_id=task_id,
+                )
+            except Exception as exc:
+                if service is not None:
+                    self._record_history_safely(
+                        lambda error=exc: service.fail_task(task_id, error)
+                    )
+                raise
+            if service is not None:
+                self._record_history_safely(lambda: service.complete_single(outcome))
+            return outcome
+
         self._run_task(
-            lambda: self.prediction_service.predict_file(
-                source_path,
-                locked_record,
-            ),
+            predict_and_record,
             "单文件推理",
             completed,
             failed,
@@ -1052,6 +1371,10 @@ class MainWindow(QMainWindow):
             return
         if not locked_identifier:
             self.batch_prediction_service.lock_model(self.batch_task, self.loaded_model)
+        if self.history_service is not None:
+            self._record_history_safely(
+                lambda: self.history_service.register_batch_running(self.batch_task)
+            )
         worker = BatchWorker(self.engine, self.batch_task)
         self.batch_worker = worker
         page = self._batch_prediction_page
@@ -1116,7 +1439,7 @@ class MainWindow(QMainWindow):
         self._set_application_state("正常")
         self.update_header_status("mode", "本地", "neutral")
         self._run_task(
-            lambda: self.batch_prediction_service.export_results(task),
+            lambda: self._export_and_register_batch(task),
             "批量结果自动导出",
             page.show_export_result,
             lambda message: page.show_feedback(f"自动导出失败：{message}", error=True),
@@ -1131,7 +1454,7 @@ class MainWindow(QMainWindow):
         self._set_application_state("推理失败")
         self.update_header_status("mode", "本地", "neutral")
         self._run_task(
-            lambda: self.batch_prediction_service.export_results(self.batch_task),
+            lambda: self._export_and_register_batch(self.batch_task),
             "批量致命错误结果导出",
             page.show_export_result,
             lambda error: page.show_feedback(f"错误结果导出失败：{error}", error=True),
@@ -1148,6 +1471,14 @@ class MainWindow(QMainWindow):
         page = self._batch_prediction_page
         page.show_feedback(f"已将 {count} 个失败项放回待处理队列。")
         page.refresh_table()
+
+    def _export_and_register_batch(self, task: BatchPredictionTask) -> object:
+        exported = self.batch_prediction_service.export_results(task)
+        if self.history_service is not None:
+            self._record_history_safely(
+                lambda: self.history_service.register_batch(task, exported)
+            )
+        return exported
 
     def _export_batch_copy(self, destination: Path) -> None:
         page = self._batch_prediction_page
@@ -1248,6 +1579,10 @@ class MainWindow(QMainWindow):
             return
         task = self.validation_service.create_task(page.report, self.loaded_model)
         self.validation_task = task
+        if self.history_service is not None:
+            self._record_history_safely(
+                lambda: self.history_service.register_validation_running(task)
+            )
         page.set_task(task)
         worker = ValidationWorker(self.engine, task)
         self.validation_worker = worker
@@ -1298,7 +1633,7 @@ class MainWindow(QMainWindow):
         self._set_application_state("正常")
         self.update_header_status("mode", "本地", "neutral")
         self._run_task(
-            lambda: self.validation_service.export_results(task),
+            lambda: self._export_and_register_validation(task),
             "验证结果自动导出",
             page.show_export_result,
             page.show_error,
@@ -1312,7 +1647,7 @@ class MainWindow(QMainWindow):
         self.update_header_status("mode", "本地", "neutral")
         if self.validation_task is not None:
             self._run_task(
-                lambda: self.validation_service.export_results(self.validation_task),
+                lambda: self._export_and_register_validation(self.validation_task),
                 "验证失败结果导出",
                 page.show_export_result,
                 page.show_error,
@@ -1350,7 +1685,7 @@ class MainWindow(QMainWindow):
             self.validation_task = task
             page.show_validation_complete(task)
             self._run_task(
-                lambda: self.validation_service.export_results(task),
+                lambda: self._export_and_register_validation(task),
                 "已有批量结果验证导出",
                 page.show_export_result,
                 page.show_error,
@@ -1389,6 +1724,23 @@ class MainWindow(QMainWindow):
             page.show_export_result,
             page.show_error,
         )
+
+    def _export_and_register_validation(self, task: ValidationTask) -> object:
+        exported = self.validation_service.export_results(task)
+        if self.history_service is not None:
+            self._record_history_safely(
+                lambda: self.history_service.register_validation(task, exported)
+            )
+        return exported
+
+    @staticmethod
+    def _record_history_safely(operation: Any) -> object | None:
+        """Keep a history-index failure from changing inference behavior."""
+        try:
+            return operation()
+        except Exception:
+            LOGGER.exception("Task history update failed; runtime workflow continues")
+            return None
 
     def _set_validation_ui_locked(self, locked: bool) -> None:
         self._single_prediction_page.setEnabled(not locked)

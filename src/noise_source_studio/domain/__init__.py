@@ -8,6 +8,17 @@ from noise_source_studio.domain.batch import (
     BatchScanSummary,
     BatchStatus,
 )
+from noise_source_studio.domain.history import (
+    HistoryArtifact,
+    HistoryOverview,
+    HistoryPageResult,
+    HistoryQuery,
+    HistoryScanReport,
+    HistoryStatus,
+    IntegrityStatus,
+    TaskHistoryRecord,
+    TaskType,
+)
 from noise_source_studio.domain.models import (
     LoadedModel,
     ModelRecord,
@@ -23,9 +34,18 @@ __all__ = [
     "BatchPredictionTask",
     "BatchScanSummary",
     "BatchStatus",
+    "HistoryArtifact",
+    "HistoryOverview",
+    "HistoryPageResult",
+    "HistoryQuery",
+    "HistoryScanReport",
+    "HistoryStatus",
+    "IntegrityStatus",
     "LoadedModel",
     "ModelRecord",
     "PackageInspection",
     "PredictionOutcome",
     "SignalPreview",
+    "TaskHistoryRecord",
+    "TaskType",
 ]
