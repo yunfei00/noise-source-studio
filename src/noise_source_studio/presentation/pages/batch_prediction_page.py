@@ -169,6 +169,7 @@ class BatchPredictionPage(QWidget):
             "添加文件夹", QStyle.StandardPixmap.SP_DirIcon, self._choose_folder
         )
         self.recursive_checkbox = QCheckBox("递归扫描子文件夹")
+        self.recursive_checkbox.setChecked(True)
         self.remove_button = self._button("移除所选", callback=self._remove_selected)
         self.clear_button = self._button("清空", callback=self.clear_requested.emit)
         self.deduplicate_button = self._button("去重", callback=self.deduplicate_requested.emit)

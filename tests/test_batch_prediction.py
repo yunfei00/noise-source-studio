@@ -435,6 +435,14 @@ def test_page_table_matches_task_count(qapp: QApplication, qtbot: QtBot, tmp_pat
     assert page.task_table.model().rowCount() == 4
 
 
+def test_recursive_folder_scan_is_selected_by_default(
+    qapp: QApplication, qtbot: QtBot
+) -> None:
+    page = BatchPredictionPage()
+    qtbot.addWidget(page)
+    assert page.recursive_checkbox.isChecked()
+
+
 def test_page_button_states_follow_lifecycle(
     qapp: QApplication, qtbot: QtBot, tmp_path: Path
 ) -> None:
