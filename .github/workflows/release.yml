@@ -43,7 +43,7 @@ jobs:
 
       - name: Build Windows executable
         shell: pwsh
-        run: pyinstaller --noconfirm --clean --windowed --onedir --name NoiseSourceStudio --collect-all PySide6 --collect-all pyqtgraph --collect-all platformdirs --collect-all pydantic --collect-all pydantic_settings --collect-all packaging src/noise_source_studio/__main__.py
+        run: pyinstaller --noconfirm --clean --windowed --onedir --name NoiseSourceStudio --add-data "src/noise_source_studio/presentation/styles;noise_source_studio/presentation/styles" --add-data "src/noise_source_studio/presentation/icons;noise_source_studio/presentation/icons" --collect-all PySide6 --collect-all pyqtgraph --collect-all platformdirs --collect-all pydantic --collect-all pydantic_settings --collect-all packaging src/noise_source_studio/__main__.py
 
       - name: Verify executable exists
         shell: pwsh
