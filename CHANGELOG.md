@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-22
+
 ### Phase 5A
 
 - 增加统一 `TaskHistoryRecord`、三类任务枚举和七种跨模块生命周期状态。
